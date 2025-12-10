@@ -1,3 +1,10 @@
+/**
+ * @file Executor.h
+ * @brief Lock-free executor for processing messages from topics
+ * @date 2024
+ * @version 1.0.0
+ * @ingroup arch_experimental
+ */
 
 #ifndef ARCH_CCR_EXECUTOR_LOCK_FREE_H
 #define ARCH_CCR_EXECUTOR_LOCK_FREE_H
@@ -13,32 +20,43 @@
 #include <thread>
 #include <vector>
 
-namespace arch
+namespace arch::experimental
 {
 
     using std::chrono_literals::operator""ms;
 
-    // Лёгкая lock-free версия Executor-а. Она избегает мьютекса для списка топиков
-    // и использует односвязный список с CAS для вставки и ленивого удаления.
-    // ВАЖНО: для упрощения управления памятью узлы списка освобождаются только
-    // при stop() — это простой, но практичный способ избежать сложных схем
-    // безопасного удаления (hazard pointers / epoch reclamation).
-
+    /**
+     * @brief Lock-free executor for processing messages from topics
+     * @ingroup arch_experimental
+     *
+     * Лёгкая lock-free версия Executor-а. Она избегает мьютекса для списка топиков
+     * и использует односвязный список с CAS для вставки и ленивого удаления.
+     * ВАЖНО: для упрощения управления памятью узлы списка освобождаются только
+     * при stop() — это простой, но практичный способ избежать сложных схем
+     * безопасного удаления (hazard pointers / epoch reclamation).
+     */
     class Executor
     {
     private:
+        /**
+         * @brief Node in lock-free linked list of topics
+         */
         struct Node
         {
-            std::weak_ptr<void> weak_topic;
-            std::function<void()> process_func;
-            std::atomic<Node*> next{nullptr};
-            std::atomic<bool> removed{false};
+            std::weak_ptr<void> weak_topic;           ///< Weak pointer to topic
+            std::function<void()> process_func;      ///< Function to process topic messages
+            std::atomic<Node*> next{nullptr};        ///< Next node in list
+            std::atomic<bool> removed{false};        ///< Removal flag
 
             Node(std::weak_ptr<void> w, std::function<void()> f)
             : weak_topic(std::move(w)), process_func(std::move(f)) {}
         };
 
     public:
+        /**
+         * @brief Constructs executor
+         * @param thread_count Number of worker threads (default: 1)
+         */
         Executor(size_t thread_count = 1)
         : running_(false), thread_count_(thread_count > 0 ? thread_count : 1), topics_processed_(0), head_(nullptr)
         {
@@ -97,23 +115,29 @@ namespace arch
                 auto slots = topic_ptr->get_slots();
                 for (auto& slot : slots)
                 {
-                    int processed          = 0;
-                    const int max_per_slot = 100;    // увеличить — меньше переключений
-                    while (processed++ < max_per_slot)
+                    // Process all available messages until queue is empty
+                    // This ensures we drain the queue efficiently under high load
+                    // Use a reasonable limit to prevent starvation of other topics
+                    int processed = 0;
+                    const int max_per_slot = 10000;  // Increased significantly for high-throughput scenarios
+                    while (processed < max_per_slot)
                     {
                         auto msg = slot->pop_message();
                         if (!msg.has_value())
-                            break;
+                            break;  // Queue is empty, move to next slot
 
                         try
                         {
                             slot->execute_callback(std::move(*msg));
+                            processed++;
                         }
                         catch (const std::exception&)
                         {
+                            processed++;  // Count even if callback throws
                         }
                         catch (...)
                         {
+                            processed++;  // Count even if callback throws
                         }
                     }
                 }
@@ -228,7 +252,10 @@ namespace arch
             }
         }
 
-        // Очищает все узлы списка. Вызывать ТОЛЬКО когда все воркеры остановлены.
+        /**
+         * @brief Cleanup all nodes in list
+         * @note Вызывать ТОЛЬКО когда все воркеры остановлены
+         */
         void cleanup_all_nodes()
         {
             Node* cur = head_.exchange(nullptr, std::memory_order_acq_rel);
@@ -251,6 +278,6 @@ namespace arch
         WaitSet waitset_;
     };
 
-}    // namespace arch
+}    // namespace arch::experimental
 
 #endif    // ARCH_CCR_EXECUTOR_LOCK_FREE_H

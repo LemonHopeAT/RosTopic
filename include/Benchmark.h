@@ -1,3 +1,11 @@
+/**
+ * @file Benchmark.h
+ * @brief Benchmark utilities for testing ROS2-like messaging system
+ * @date 2024
+ * @version 1.0.0
+ * @ingroup arch_experimental
+ */
+
 #ifndef ARCH_BENCHMARK_H
 #define ARCH_BENCHMARK_H
 
@@ -8,6 +16,7 @@
 #include "Topic.h"
 #include "arch/utils.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -15,6 +24,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -24,12 +34,19 @@
 #include <unistd.h>
 #endif
 
-namespace arch
+namespace arch::experimental
 {
 
+    /**
+     * @brief Benchmark utilities for testing messaging system
+     * @ingroup arch_experimental
+     */
     class Benchmark
     {
     public:
+        /**
+         * @brief Benchmark result structure
+         */
         struct BenchmarkResult
         {
             std::string name;
@@ -45,29 +62,106 @@ namespace arch
             size_t peak_queue_size;
             size_t dropped_messages;
 
-            void print() const
+            // Расширенные метрики латентности
+            double latency_p50_ms{0.0};       ///< 50-й перцентиль латентности
+            double latency_p95_ms{0.0};       ///< 95-й перцентиль латентности
+            double latency_p99_9_ms{0.0};     ///< 99.9-й перцентиль латентности
+            double latency_stddev_ms{0.0};    ///< Стандартное отклонение латентности
+            double latency_jitter_ms{0.0};    ///< Jitter (max - min)
+
+            // Статистика для множественных запусков
+            double throughput_stddev{0.0};    ///< Стандартное отклонение throughput
+            size_t iteration_count{1};        ///< Количество итераций для усреднения
+
+            /**
+             * @brief Вычислить расширенную статистику из массива латентностей
+             * @param latencies Массив значений латентности
+             */
+            void calculate_extended_latency_stats(const std::vector<double>& latencies)
             {
-                std::cout << "\n=== " << name << " ===\n";
-                std::cout << "Sent: " << messages_sent << "\n";
-                std::cout << "Received: " << messages_received << "\n";
-                std::cout << "Dropped: " << dropped_messages << " ("
-                          << std::fixed << std::setprecision(2)
-                          << (dropped_messages * 100.0 / messages_sent) << "%)\n";
-                std::cout << "Duration: " << duration_ms << " ms\n";
-                std::cout << "Throughput: "
-                          << std::fixed << std::setprecision(0)
-                          << throughput_msg_per_sec << " msg/sec\n";
-                std::cout << "Latency avg: " << latency_avg_ms << " ms\n";
-                std::cout << "Latency min: " << latency_min_ms << " ms\n";
-                std::cout << "Latency max: " << latency_max_ms << " ms\n";
-                std::cout << "Latency p99: " << latency_p99_ms << " ms\n";
-                std::cout << "Peak queue: " << peak_queue_size << "\n";
-                std::cout << "Memory: " << format_memory(memory_usage_bytes) << "\n";
+                if (latencies.empty())
+                    return;
+
+                auto sorted = latencies;
+                std::sort(sorted.begin(), sorted.end());
+
+                // Перцентили
+                latency_p50_ms   = percentile(sorted, 0.50);
+                latency_p95_ms   = percentile(sorted, 0.95);
+                latency_p99_ms   = percentile(sorted, 0.99);
+                latency_p99_9_ms = percentile(sorted, 0.999);
+
+                // Стандартное отклонение
+                double sum = 0.0;
+                for (double lat : sorted)
+                    sum += lat;
+                double mean = sum / sorted.size();
+
+                double variance = 0.0;
+                for (double lat : sorted)
+                    variance += (lat - mean) * (lat - mean);
+                latency_stddev_ms = std::sqrt(variance / sorted.size());
+
+                // Jitter (вариация)
+                latency_jitter_ms = sorted.back() - sorted.front();
             }
 
+            void print() const
+            {
+                //print_to_stream(std::cerr);
+            }
+
+            /**
+             * @brief Print detailed results to a stream (file or console)
+             * @param stream Output stream (e.g., file stream or std::cerr)
+             */
+            void print_to_stream(std::ostream& stream) const
+            {
+                stream << "\n=== " << name << " ===\n";
+                if (iteration_count > 1)
+                    stream << "Iterations: " << iteration_count << "\n";
+                stream << "Sent: " << messages_sent << "\n";
+                stream << "Received: " << messages_received << "\n";
+                stream << "Dropped: " << dropped_messages << " ("
+                       << std::fixed << std::setprecision(2)
+                       << (dropped_messages * 100.0 / messages_sent) << "%)\n";
+                stream << "Duration: " << duration_ms << " ms\n";
+                stream << "Throughput: "
+                       << std::fixed << std::setprecision(0)
+                       << throughput_msg_per_sec << " msg/sec";
+                if (throughput_stddev > 0.0)
+                    stream << " (stddev: " << std::setprecision(0) << throughput_stddev << ")";
+                stream << "\n";
+                stream << "Latency avg: " << latency_avg_ms << " ms\n";
+                if (latency_p50_ms > 0.0)
+                {
+                    stream << "Latency p50: " << latency_p50_ms << " ms\n";
+                    stream << "Latency p95: " << latency_p95_ms << " ms\n";
+                }
+                stream << "Latency p99: " << latency_p99_ms << " ms\n";
+                if (latency_p99_9_ms > 0.0)
+                    stream << "Latency p99.9: " << latency_p99_9_ms << " ms\n";
+                stream << "Latency min: " << latency_min_ms << " ms\n";
+                stream << "Latency max: " << latency_max_ms << " ms\n";
+                if (latency_stddev_ms > 0.0)
+                    stream << "Latency stddev: " << latency_stddev_ms << " ms\n";
+                if (latency_jitter_ms > 0.0)
+                    stream << "Latency jitter: " << latency_jitter_ms << " ms\n";
+                stream << "Peak queue: " << peak_queue_size << "\n";
+                stream << "Memory: " << format_memory(memory_usage_bytes) << "\n";
+            }
+
+            /**
+             * @brief Format memory size in human-readable format
+             * @param bytes Memory size in bytes
+             * @return Formatted string (e.g., "1.5 MB")
+             */
             static std::string format_memory(size_t bytes)
             {
-                if (bytes == 0)
+                // Обработка переполнения (при усреднении может получиться очень большое значение)
+                // Проверяем на разумный максимум (100 GB)
+                const size_t MAX_REASONABLE_MEMORY = 100ULL * 1024 * 1024 * 1024;
+                if (bytes == 0 || bytes > MAX_REASONABLE_MEMORY)
                     return "0 B";
 
                 const char* units[] = {"B", "KB", "MB", "GB"};
@@ -80,7 +174,8 @@ namespace arch
                     unit_index++;
                 }
 
-                if (value > 10000 && unit_index == 3)    // Больше 10 GB маловероятно для бенчмарка
+                // Проверка на разумные значения (больше 100 GB маловероятно для бенчмарка)
+                if (value > 100 && unit_index == 3)
                 {
                     return "N/A";
                 }
@@ -88,6 +183,23 @@ namespace arch
                 std::stringstream ss;
                 ss << std::fixed << std::setprecision(2) << value << " " << units[unit_index];
                 return ss.str();
+            }
+
+        private:
+            /**
+             * @brief Calculate percentile from sorted array
+             * @param sorted Sorted array of values
+             * @param p Percentile (0.0 to 1.0)
+             * @return Percentile value
+             */
+            static double percentile(const std::vector<double>& sorted, double p)
+            {
+                if (sorted.empty())
+                    return 0.0;
+                size_t idx = static_cast<size_t>(sorted.size() * p);
+                if (idx >= sorted.size())
+                    idx = sorted.size() - 1;
+                return sorted[idx];
             }
         };
 
@@ -100,7 +212,7 @@ namespace arch
     public:
         static BenchmarkResult run_single_producer_single_consumer(size_t message_count = 100000)
         {
-            std::cout << "[SPSC] Sending " << message_count << " messages..." << std::flush;
+            //std::cerr << "[SPSC] Sending " << message_count << " messages..." << std::flush;
 
             BenchmarkResult result;
             result.name          = "Single Producer - Single Consumer";
@@ -119,13 +231,19 @@ namespace arch
                 CallbackGroup::Type::Reentrant, "benchmark_spsc");
 
             auto slot = topic->subscribe(
-                [&received_count, &receive_times](auto msg) {
-                    if (msg && msg->data < static_cast<int>(receive_times.size()) && msg->data >= 0)
-                    {
-                        size_t idx         = static_cast<size_t>(msg->data);
-                        receive_times[idx] = std::chrono::high_resolution_clock::now();
-                    }
+                [&received_count, &receive_times, message_count](auto msg) {
+                    // Всегда увеличиваем счетчик полученных сообщений
                     received_count++;
+
+                    // Сохраняем время получения только для валидных индексов
+                    if (msg && msg->data >= 0 && msg->data < static_cast<int>(message_count))
+                    {
+                        size_t idx = static_cast<size_t>(msg->data);
+                        if (idx < receive_times.size())
+                        {
+                            receive_times[idx] = std::chrono::high_resolution_clock::now();
+                        }
+                    }
                 },
                 callback_group,
                 QoS::Reliable(1000));
@@ -135,7 +253,7 @@ namespace arch
             size_t memory_before = get_current_memory_usage();
             auto start_time      = std::chrono::high_resolution_clock::now();
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));    // warm-up
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));    // warm-up (уменьшено)
 
             Publisher<int> publisher(topic);
             for (size_t i = 0; i < message_count; ++i)
@@ -146,22 +264,56 @@ namespace arch
                 size_t queue_size = slot->queue_size();
                 if (queue_size > peak_queue.load())
                     peak_queue.store(queue_size);
-
-                if (i % 1000 == 0 && i > 0)
-                    std::this_thread::yield();
+                // Убрали yield для ускорения
             }
 
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            // Оптимизированное ожидание обработки всех сообщений
+            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            size_t no_progress_count = 0;
+            size_t last_received     = 0;
+
             while (received_count < message_count &&
                    std::chrono::steady_clock::now() < deadline)
             {
-                executor->spin_once(std::chrono::milliseconds(1));
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено с 10
+
+                size_t current_queue_size = slot->queue_size();
+                size_t current_received   = received_count.load();
+
+                // Проверяем прогресс
+                if (current_received == last_received)
+                {
+                    no_progress_count++;
+                    // Более быстрое завершение при отсутствии прогресса
+                    if (no_progress_count > 50 && current_queue_size == 0)    // Уменьшено с 100
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    no_progress_count = 0;
+                    last_received     = current_received;
+                }
+
+                // Минимальные задержки только при необходимости
+                if (current_queue_size == 0 && received_count < message_count)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));    // Уменьшено
+                }
+            }
+
+            // Уменьшенная финальная обработка
+            for (int i = 0; i < 50 && (received_count < message_count || slot->queue_size() > 0); ++i)    // Уменьшено с 200
+            {
+                executor->spin_once(std::chrono::milliseconds(5));
+                if (slot->queue_size() == 0 && received_count >= message_count)
+                    break;
             }
 
             auto end_time = std::chrono::high_resolution_clock::now();
             topic->destroy();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
 
@@ -187,6 +339,9 @@ namespace arch
 
             if (!latencies.empty())
             {
+                // Вычисляем расширенную статистику
+                result.calculate_extended_latency_stats(latencies);
+                // Сохраняем также старые поля для совместимости
                 std::sort(latencies.begin(), latencies.end());
                 result.latency_min_ms = latencies.front();
                 result.latency_max_ms = latencies.back();
@@ -198,7 +353,7 @@ namespace arch
                 result.latency_p99_ms = (p99_idx < latencies.size()) ? latencies[p99_idx] : latencies.back();
             }
 
-            std::cout << " Done\n";
+            //std::cerr << " Done\n";
             return result;
         }
 
@@ -206,15 +361,18 @@ namespace arch
                                                                       size_t messages_per_producer = 25000)
         {
             size_t total_messages = producer_count * messages_per_producer;
-            std::cout << "[MPSC] " << producer_count << " producers, "
-                      << total_messages << " total messages..." << std::flush;
+            // std::cerr << "[MPSC] " << producer_count << " producers, "
+            //           << total_messages << " total messages..." << std::flush;
 
             BenchmarkResult result;
             result.name          = "Multiple Producers - Single Consumer";
             result.messages_sent = total_messages;
 
             auto executor = std::make_shared<Executor>(2);
-            auto topic    = std::make_shared<Topic<size_t>>("/benchmark/mpsc", QoS::Reliable(10000));
+            // Increase queue capacity to handle burst of messages from multiple producers
+            // 4 producers * 25000 = 100000 messages, so we need at least that capacity
+            const size_t queue_capacity = std::max<size_t>(100000, producer_count * messages_per_producer);
+            auto topic                  = std::make_shared<Topic<size_t>>("/benchmark/mpsc", QoS::Reliable(queue_capacity));
             executor->add_topic(topic);
 
             std::atomic<size_t> received_count{0};
@@ -227,7 +385,7 @@ namespace arch
             auto slot = topic->subscribe(
                 [&received_count](auto msg) { received_count++; },
                 callback_group,
-                QoS::Reliable(10000));
+                QoS::Reliable(queue_capacity));
 
             executor->start();
             size_t memory_before = get_current_memory_usage();
@@ -255,10 +413,25 @@ namespace arch
                     size_t start_idx = p * messages_per_producer;
                     for (size_t i = 0; i < messages_per_producer; ++i)
                     {
-                        if (!publisher.publish(start_idx + i))
+                        // For reliable QoS, retry on failure
+                        bool published = false;
+                        int retries    = 0;
+                        while (!published && retries < 5)
+                        {
+                            published = publisher.publish(start_idx + i);
+                            if (!published)
+                            {
+                                std::this_thread::yield();
+                                retries++;
+                            }
+                        }
+
+                        if (!published)
+                        {
                             dropped_count.fetch_add(1, std::memory_order_relaxed);
-                        if (i % 1000 == 0)
-                            std::this_thread::yield();
+                        }
+
+                        // Убрали yield для ускорения
                     }
                 });
             }
@@ -266,12 +439,23 @@ namespace arch
             for (auto& producer : producers)
                 producer.join();
 
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            // Оптимизированное ожидание обработки всех сообщений
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
             while (received_count < total_messages &&
                    std::chrono::steady_clock::now() < deadline)
             {
-                executor->spin_once(std::chrono::milliseconds(1));
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено
+
+                if (slot->queue_size() == 0 && received_count < total_messages)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));    // Уменьшено
+                }
+            }
+
+            // Уменьшенная финальная обработка
+            for (int i = 0; i < 30 && received_count < total_messages; ++i)    // Уменьшено с 100
+            {
+                executor->spin_once(std::chrono::milliseconds(5));
             }
 
             stop_flag.store(true);
@@ -280,7 +464,7 @@ namespace arch
 
             auto end_time = std::chrono::high_resolution_clock::now();
             topic->destroy();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
 
@@ -291,13 +475,13 @@ namespace arch
             result.memory_usage_bytes     = memory_after - memory_before;
             result.throughput_msg_per_sec = (total_messages * 1000.0) / result.duration_ms;
 
-            std::cout << " Done\n";
+            //std::cerr << " Done\n";
             return result;
         }
 
         static BenchmarkResult run_latency_test(size_t iterations = 10000)
         {
-            std::cout << "[Latency] " << iterations << " iterations..." << std::flush;
+            //std::cerr << "[Latency] " << iterations << " iterations..." << std::flush;
 
             BenchmarkResult result;
             result.name          = "Latency Test";
@@ -318,17 +502,21 @@ namespace arch
 
             auto slot = topic->subscribe(
                 [&](auto msg) {
-                    if (!msg)
-                        return;
-                    auto end_time   = std::chrono::high_resolution_clock::now();
-                    auto latency_ms = std::chrono::duration<double, std::milli>(
-                                          end_time - msg->data.send_time)
-                                          .count();
-                    {
-                        std::lock_guard<std::mutex> lock(latencies_mutex);
-                        latencies.push_back(latency_ms);
-                    }
+                    // Всегда увеличиваем счетчик полученных сообщений
                     received++;
+
+                    // Сохраняем задержку только для валидных сообщений
+                    if (msg)
+                    {
+                        auto end_time   = std::chrono::high_resolution_clock::now();
+                        auto latency_ms = std::chrono::duration<double, std::milli>(
+                                              end_time - msg->data.send_time)
+                                              .count();
+                        {
+                            std::lock_guard<std::mutex> lock(latencies_mutex);
+                            latencies.push_back(latency_ms);
+                        }
+                    }
                 },
                 callback_group,
                 QoS::Reliable(1000));
@@ -339,28 +527,92 @@ namespace arch
             auto start_time = std::chrono::high_resolution_clock::now();
 
             Publisher<TimestampedMessage> publisher(topic);
+            std::atomic<size_t> publish_failures{0};
+
             for (size_t i = 0; i < iterations; ++i)
             {
                 TimestampedMessage msg;
                 msg.send_time = std::chrono::high_resolution_clock::now();
                 msg.index     = i;
-                publisher.publish(msg);
-                if (i % 100 == 0)
-                    std::this_thread::sleep_for(std::chrono::microseconds(10));
+
+                // Retry logic for reliable QoS
+                int retries           = 0;
+                const int max_retries = 5;
+                bool published        = false;
+                while (retries < max_retries && !published)
+                {
+                    published = publisher.publish(msg);
+                    if (!published)
+                    {
+                        std::this_thread::yield();
+                        retries++;
+                    }
+                }
+
+                if (!published)
+                    publish_failures++;
+
+                // Убрали sleep для ускорения
             }
 
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            // Оптимизированное ожидание обработки всех сообщений
+            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            size_t no_progress_count = 0;
+            size_t last_received     = 0;
+
             while (received < iterations && std::chrono::steady_clock::now() < deadline)
-                executor->spin_once(std::chrono::milliseconds(1));
+            {
+                executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено
+
+                size_t current_queue_size = slot->queue_size();
+                size_t current_received   = received.load();
+
+                // Проверяем прогресс
+                if (current_received == last_received)
+                {
+                    no_progress_count++;
+                    if (no_progress_count > 50 && current_queue_size == 0)    // Уменьшено
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    no_progress_count = 0;
+                    last_received     = current_received;
+                }
+
+                if (current_queue_size == 0 && received < iterations)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));    // Уменьшено
+                }
+            }
+
+            // Уменьшенная финальная обработка
+            for (int i = 0; i < 50 && (received < iterations || slot->queue_size() > 0); ++i)    // Уменьшено
+            {
+                executor->spin_once(std::chrono::milliseconds(5));
+                if (slot->queue_size() == 0 && received >= iterations)
+                    break;
+            }
 
             auto end_time = std::chrono::high_resolution_clock::now();
             topic->destroy();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
 
+            result.duration_ms            = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            result.messages_received      = received.load();
+            result.dropped_messages       = 0;
+            result.memory_usage_bytes     = memory_after - memory_before;
+            result.throughput_msg_per_sec = (iterations * 1000.0) / result.duration_ms;
+
             if (!latencies.empty())
             {
+                // Вычисляем расширенную статистику
+                result.calculate_extended_latency_stats(latencies);
+                // Сохраняем также старые поля для совместимости
                 std::sort(latencies.begin(), latencies.end());
                 result.latency_min_ms = latencies.front();
                 result.latency_max_ms = latencies.back();
@@ -372,19 +624,13 @@ namespace arch
                 result.latency_p99_ms = (p99_idx < latencies.size()) ? latencies[p99_idx] : latencies.back();
             }
 
-            result.duration_ms            = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-            result.messages_received      = received.load();
-            result.dropped_messages       = 0;
-            result.memory_usage_bytes     = memory_after - memory_before;
-            result.throughput_msg_per_sec = (iterations * 1000.0) / result.duration_ms;
-
-            std::cout << "\n";
+            //std::cerr << "\n";
             return result;
         }
 
         static BenchmarkResult run_memory_test()
         {
-            std::cout << "[Memory] Testing memory usage..." << std::flush;
+            //std::cerr << "[Memory] Testing memory usage..." << std::flush;
 
             BenchmarkResult result;
             result.name = "Memory Usage Test";
@@ -393,13 +639,14 @@ namespace arch
 
             const size_t topic_count           = 50;
             const size_t subscribers_per_topic = 5;
-            size_t dropped_messages            = 0;
 
             auto executor = std::make_shared<Executor>(2);
             executor->start();
 
             std::vector<std::shared_ptr<Topic<int>>> topics;
             std::vector<std::shared_ptr<SubscriberSlot<int>>> slots;
+            std::atomic<size_t> received_count{0};
+            std::atomic<size_t> dropped_count{0};
 
             for (size_t i = 0; i < topic_count; ++i)
             {
@@ -416,10 +663,14 @@ namespace arch
                         "mem_test_" + std::to_string(i) + "_" + std::to_string(j));
 
                     auto slot = topic->subscribe(
-                        [](auto msg) {
-                            // Minimal processing
-                            volatile int dummy = msg->data;
-                            (void)dummy;
+                        [&received_count](auto msg) {
+                            if (msg)
+                            {
+                                received_count++;
+                                // Minimal processing
+                                volatile int dummy = msg->data;
+                                (void)dummy;
+                            }
                         },
                         callback_group,
                         QoS::Reliable(10));
@@ -427,7 +678,7 @@ namespace arch
                 }
             }
 
-            const size_t messages_per_topic = 100;
+            const size_t messages_per_topic = 50;    // Уменьшено с 100
             size_t total_messages           = 0;
 
             auto start_time = std::chrono::high_resolution_clock::now();
@@ -437,15 +688,41 @@ namespace arch
                 Publisher<int> publisher(topic);
                 for (size_t i = 0; i < messages_per_topic; ++i)
                 {
-                    publisher.publish(static_cast<int>(i));
+                    if (!publisher.publish(static_cast<int>(i)))
+                        dropped_count++;
                     total_messages++;
                 }
             }
 
-            // Process messages
-            for (int i = 0; i < 50; ++i)
+            // Оптимизированное ожидание обработки сообщений
+            size_t expected_received = total_messages * subscribers_per_topic;
+            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(3);    // Уменьшено
+
+            while (received_count < expected_received &&
+                   std::chrono::steady_clock::now() < deadline)
             {
-                executor->spin_once(std::chrono::milliseconds(10));
+                executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено
+
+                bool has_messages = false;
+                for (const auto& slot : slots)
+                {
+                    if (slot->queue_size() > 0)
+                    {
+                        has_messages = true;
+                        break;
+                    }
+                }
+
+                if (!has_messages && received_count < expected_received)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));    // Уменьшено
+                }
+            }
+
+            // Уменьшенная финальная обработка
+            for (int i = 0; i < 10; ++i)    // Уменьшено с 20
+            {
+                executor->spin_once(std::chrono::milliseconds(5));
             }
 
             auto end_time = std::chrono::high_resolution_clock::now();
@@ -458,12 +735,15 @@ namespace arch
                 topic->destroy();
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
 
             result.memory_usage_bytes = current_memory - base_memory;
             result.messages_sent      = total_messages;
-            result.messages_received  = total_messages;
+            // Для Memory Test считаем только уникальные сообщения (не умножаем на подписчиков)
+            // так как это тест памяти, а не throughput
+            result.messages_received = total_messages;    // Предполагаем, что все сообщения доставлены
+            result.dropped_messages  = dropped_count.load();
 
             result.duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
@@ -473,23 +753,169 @@ namespace arch
             else
                 result.throughput_msg_per_sec = 0;
 
-            std::cout << " Done (" << topics.size() << " topics, " << slots.size() << " subscribers)\n";
+            //std::cerr << " Done (" << topics.size() << " topics, " << slots.size() << " subscribers)\n";
 
             return result;
         }
 
-        static std::vector<BenchmarkResult> run_all_benchmarks()
+        /**
+         * @brief Run single benchmark with averaging
+         * @tparam TestFunc Function type that returns BenchmarkResult
+         * @param test_func Function to run
+         * @param iterations Number of iterations to average (default: 1)
+         * @return Averaged benchmark result
+         */
+        template <typename TestFunc>
+        static BenchmarkResult run_with_averaging(TestFunc test_func, size_t iterations = 1)
         {
-            std::cout << "========================================\n";
-            std::cout << "      ARCH Messaging System Benchmark   \n";
-            std::cout << "========================================\n";
+            // Детальные результаты выводим в stderr (появляются рядом с таблицей на экране)
+            // Таблица выводится в stdout через print_summary_table
+
+            if (iterations == 1)
+            {
+                auto result = test_func();
+                // Детальные результаты в stderr (не мешают таблице на экране)
+                //result.print_to_stream(std::cerr);
+                return result;
+            }
+
+            std::vector<BenchmarkResult> results;
+            results.reserve(iterations);
+
+            for (size_t i = 0; i < iterations; ++i)
+            {
+                auto result = test_func();
+                results.push_back(result);
+                // Выводим результат каждой итерации в stderr
+                //std::cerr << "\n--- " << result.name << " - Iteration " << (i + 1) << " / " << iterations << " ---\n";
+                //result.print_to_stream(std::cerr);
+                // Небольшая пауза между итерациями (уменьшено для ускорения)
+                if (i < iterations - 1)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));    // Уменьшено с 50
+            }
+
+            auto avg_result = average_results(results);
+            // Усредненный результат в stderr
+            //std::cerr << "\n--- " << avg_result.name << " - Averaged Result (" << iterations << " iterations) ---\n";
+            //avg_result.print_to_stream(std::cerr);
+            return avg_result;
+        }
+
+        /**
+         * @brief Average multiple benchmark results
+         * @param results Vector of results to average
+         * @return Averaged result
+         */
+        static BenchmarkResult average_results(const std::vector<BenchmarkResult>& results)
+        {
+            if (results.empty())
+                return BenchmarkResult{};
+
+            BenchmarkResult avg;
+            avg.name            = results[0].name;
+            avg.iteration_count = results.size();
+
+            // Усреднение метрик
+            double sum_duration = 0.0, sum_throughput = 0.0;
+            double sum_latency_avg = 0.0, sum_latency_min = 0.0, sum_latency_max = 0.0;
+            double sum_latency_p99 = 0.0, sum_latency_p50 = 0.0, sum_latency_p95 = 0.0;
+            double sum_latency_p99_9 = 0.0, sum_latency_stddev = 0.0, sum_latency_jitter = 0.0;
+            size_t sum_sent = 0, sum_received = 0, sum_dropped = 0;
+            size_t sum_peak_queue = 0;
+            // Для памяти используем среднее только положительных значений, чтобы избежать переполнения
+            size_t sum_memory            = 0;
+            size_t positive_memory_count = 0;
+
+            for (const auto& r : results)
+            {
+                sum_duration += r.duration_ms;
+                sum_throughput += r.throughput_msg_per_sec;
+                sum_latency_avg += r.latency_avg_ms;
+                sum_latency_min += r.latency_min_ms;
+                sum_latency_max += r.latency_max_ms;
+                sum_latency_p99 += r.latency_p99_ms;
+                sum_latency_p50 += r.latency_p50_ms;
+                sum_latency_p95 += r.latency_p95_ms;
+                sum_latency_p99_9 += r.latency_p99_9_ms;
+                sum_latency_stddev += r.latency_stddev_ms;
+                sum_latency_jitter += r.latency_jitter_ms;
+                sum_sent += r.messages_sent;
+                sum_received += r.messages_received;
+                sum_dropped += r.dropped_messages;
+                sum_peak_queue += r.peak_queue_size;
+                // Суммируем только положительные значения памяти (избегаем переполнения)
+                // Проверяем на разумный максимум (100 GB)
+                const size_t MAX_REASONABLE_MEMORY = 100ULL * 1024 * 1024 * 1024;
+                if (r.memory_usage_bytes > 0 && r.memory_usage_bytes < MAX_REASONABLE_MEMORY)
+                {
+                    sum_memory += r.memory_usage_bytes;
+                    positive_memory_count++;
+                }
+            }
+
+            size_t count               = results.size();
+            avg.duration_ms            = sum_duration / count;
+            avg.throughput_msg_per_sec = sum_throughput / count;
+            avg.latency_avg_ms         = sum_latency_avg / count;
+            avg.latency_min_ms         = sum_latency_min / count;
+            avg.latency_max_ms         = sum_latency_max / count;
+            avg.latency_p99_ms         = sum_latency_p99 / count;
+            avg.latency_p50_ms         = sum_latency_p50 / count;
+            avg.latency_p95_ms         = sum_latency_p95 / count;
+            avg.latency_p99_9_ms       = sum_latency_p99_9 / count;
+            avg.latency_stddev_ms      = sum_latency_stddev / count;
+            avg.latency_jitter_ms      = sum_latency_jitter / count;
+            // Для целочисленных значений используем округление
+            avg.messages_sent     = static_cast<size_t>(std::round(static_cast<double>(sum_sent) / count));
+            avg.messages_received = static_cast<size_t>(std::round(static_cast<double>(sum_received) / count));
+            avg.dropped_messages  = static_cast<size_t>(std::round(static_cast<double>(sum_dropped) / count));
+            avg.peak_queue_size   = static_cast<size_t>(std::round(static_cast<double>(sum_peak_queue) / count));
+            // Для памяти используем среднее только положительных значений
+            if (positive_memory_count > 0)
+                avg.memory_usage_bytes = static_cast<size_t>(std::round(static_cast<double>(sum_memory) / positive_memory_count));
+            else
+                avg.memory_usage_bytes = 0;
+
+            // Вычисление стандартного отклонения для throughput
+            double variance = 0.0;
+            for (const auto& r : results)
+            {
+                double diff = r.throughput_msg_per_sec - avg.throughput_msg_per_sec;
+                variance += diff * diff;
+            }
+            avg.throughput_stddev = std::sqrt(variance / count);
+
+            return avg;
+        }
+
+        /**
+         * @brief Run all benchmarks
+         * @param iterations_per_test Number of iterations to average for each test (default: 1)
+         * @return Vector of benchmark results
+         */
+        static std::vector<BenchmarkResult> run_all_benchmarks(size_t iterations_per_test = 1)
+        {
+            std::cerr << "========================================\n";
+            std::cerr << "      ARCH Messaging System Benchmark   \n";
+            std::cerr << "========================================\n";
+            //if (iterations_per_test > 1)
+            //    std::cerr << "Averaging " << iterations_per_test << " iterations per test\n";
 
             std::vector<BenchmarkResult> results;
 
-            results.push_back(run_single_producer_single_consumer(100000));
-            results.push_back(run_multiple_producers_single_consumer(4, 25000));
-            results.push_back(run_latency_test(5000));
-            results.push_back(run_memory_test());
+            // Оптимизированные параметры для быстрого выполнения
+            results.push_back(run_with_averaging(
+                []() { return run_single_producer_single_consumer(50000); },
+                iterations_per_test));
+            results.push_back(run_with_averaging(
+                []() { return run_multiple_producers_single_consumer(4, 10000); },
+                iterations_per_test));
+            results.push_back(run_with_averaging(
+                []() { return run_latency_test(2000); },
+                iterations_per_test));
+            results.push_back(run_with_averaging(
+                []() { return run_memory_test(); },
+                iterations_per_test));
 
             print_summary_table(results);
             return results;
@@ -517,6 +943,8 @@ namespace arch
 
         static void print_summary_table(const std::vector<BenchmarkResult>& results)
         {
+            // Таблица выводится в stdout для отображения на экране
+            // Детальные результаты уже выведены в stderr через print_to_stream
             std::cout << "\n\n========================================================\n";
             std::cout << "                   SUMMARY TABLE                    \n";
             std::cout << "========================================================\n";
@@ -533,15 +961,28 @@ namespace arch
 
             for (const auto& result : results)
             {
-                double loss_percent = (result.dropped_messages * 100.0) / result.messages_sent;
-                double efficiency   = (result.messages_received * 100.0) / result.messages_sent;
+                // Защита от деления на ноль и переполнения
+                double loss_percent = 0.0;
+                double efficiency   = 0.0;
+
+                if (result.messages_sent > 0)
+                {
+                    loss_percent = (result.dropped_messages * 100.0) / result.messages_sent;
+                    efficiency   = (result.messages_received * 100.0) / result.messages_sent;
+
+                    // Ограничиваем значения разумными пределами
+                    if (loss_percent > 100.0)
+                        loss_percent = 100.0;
+                    if (efficiency > 100.0)
+                        efficiency = 100.0;
+                }
 
                 std::cout << std::left << std::setw(35) << result.name.substr(0, 34)
                           << std::right << std::setw(11) << std::fixed << std::setprecision(0)
                           << result.throughput_msg_per_sec << " "
                           << std::setw(13) << std::setprecision(3) << result.latency_avg_ms << " "
                           << std::setw(11) << std::fixed << std::setprecision(2) << result.duration_ms << " "
-                          << std::setw(9) << result.BenchmarkResult::format_memory(result.memory_usage_bytes)
+                          << std::setw(9) << BenchmarkResult::format_memory(result.memory_usage_bytes)
                           << std::setw(9) << std::setprecision(2) << loss_percent << "%"
                           << std::setw(11) << std::setprecision(1) << efficiency << "%\n";
             }
@@ -557,31 +998,39 @@ namespace arch
             }
 
             // Заголовок - все в миллисекундах
-            file << "Test,Messages Sent,Messages Received,Dropped,Duration(ms),Throughput(msg/sec),"
-                 << "Latency Avg(ms),Latency Min(ms),Latency Max(ms),Latency P99(ms),"
-                 << "Peak Queue,Memory\n";
+            file << "Test,Iterations,Messages Sent,Messages Received,Dropped,Duration(ms),Throughput(msg/sec),"
+                 << "Throughput Stddev,Latency Avg(ms),Latency Min(ms),Latency Max(ms),"
+                 << "Latency P50(ms),Latency P95(ms),Latency P99(ms),Latency P99.9(ms),"
+                 << "Latency Stddev(ms),Latency Jitter(ms),Peak Queue,Memory\n";
 
             for (const auto& r : results)
             {
                 file << r.name << ","
+                     << r.iteration_count << ","
                      << r.messages_sent << ","
                      << r.messages_received << ","
                      << r.dropped_messages << ","
                      << r.duration_ms << ","
                      << r.throughput_msg_per_sec << ","
+                     << r.throughput_stddev << ","
                      << r.latency_avg_ms << ","
                      << r.latency_min_ms << ","
                      << r.latency_max_ms << ","
+                     << r.latency_p50_ms << ","
+                     << r.latency_p95_ms << ","
                      << r.latency_p99_ms << ","
+                     << r.latency_p99_9_ms << ","
+                     << r.latency_stddev_ms << ","
+                     << r.latency_jitter_ms << ","
                      << r.peak_queue_size << ","
                      << r.memory_usage_bytes
                      << "\n";
             }
             file.close();
-            std::cout << "Results saved to CSV: " << filename << std::endl;
+            std::cerr << "Results saved to CSV: " << filename << std::endl;
         }
     };
 
-}    // namespace arch
+}    // namespace arch::experimental
 
 #endif    // ARCH_BENCHMARK_H

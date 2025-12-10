@@ -1,0 +1,60 @@
+*.user 
+*.a
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+*.orig
+
+# Packages #
+############
+# it's better to unpack these files and commit the raw source
+# git has its own built in compression methods
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Logs and databases #
+######################
+*.log
+moc_*.cpp
+*.autosave
+
+# Builds dirrectory #
+######################
+build/
+build-*
+
+BUILD_QT
+
+Abstractions/build/*
+Cameras/build/*
+FactoryDevice/build/*
+Forpost/build/*
+L410/build/*
+StartUp/build/*
+Styles/build/*
+Task/build/*
+Udp/build/*
+UsbDevices/build/*
+Utility/build/*
+UtilityFrontend/build/*
+Version/build/*
+CMake_Trash/*
+StartUp/*.ini
+*/*/build
+*/build
+install_libs/*
+install_libs/include/*
+install_libs/lib/*
+
+# JavaScript packages directory
+###############################
+node_modules/

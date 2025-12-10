@@ -1,3 +1,10 @@
+/**
+ * @file Topic.h
+ * @brief Topic implementation with lock-free subscriber management
+ * @date 2024
+ * @version 1.0.0
+ * @ingroup arch_experimental
+ */
 
 #ifndef ARCH_COMM_TOPIC_H
 #define ARCH_COMM_TOPIC_H
@@ -14,29 +21,45 @@
 #include <string>
 #include <vector>
 
-namespace arch
+namespace arch::experimental
 {
 
-    // EpochReclaimer: lock-free registration via singly-linked list of per-thread nodes.
-    // Each thread allocates one Node and pushes it to head_ on first register.
-    // Readers call enter(node)/leave(node) using their thread-local node pointer.
+    /**
+     * @brief Epoch-based memory reclaimer for lock-free data structures
+     * @ingroup arch_experimental
+     *
+     * Lock-free registration via singly-linked list of per-thread nodes.
+     * Each thread allocates one Node and pushes it to head_ on first register.
+     * Readers call enter(node)/leave(node) using their thread-local node pointer.
+     */
     class EpochReclaimer
     {
     public:
+        /**
+         * @brief Per-thread epoch node
+         */
         struct Node
         {
-            std::atomic<uint64_t> epoch;
-            Node* next;
+            std::atomic<uint64_t> epoch;    ///< Current epoch for this thread
+            Node* next;                      ///< Next node in linked list
             Node(uint64_t v) : epoch(v), next(nullptr) {}
         };
 
+        /**
+         * @brief Get singleton instance
+         * @return Reference to EpochReclaimer instance
+         */
         static EpochReclaimer& instance()
         {
             static EpochReclaimer inst;
             return inst;
         }
 
-        // Return thread-local Node*; create and push to list on first call (lock-free push_front).
+        /**
+         * @brief Register current thread and return thread-local node
+         * @return Pointer to thread-local node
+         * @note Creates and pushes to list on first call (lock-free push_front)
+         */
         Node* register_thread()
         {
             static thread_local Node* t_node = nullptr;
@@ -59,6 +82,10 @@ namespace arch
             return t_node;
         }
 
+        /**
+         * @brief Enter epoch (mark thread as active reader)
+         * @param n Thread-local node
+         */
         void enter(Node* n)
         {
             if (!n)
@@ -67,6 +94,10 @@ namespace arch
             n->epoch.store(g, std::memory_order_release);
         }
 
+        /**
+         * @brief Leave epoch (mark thread as inactive)
+         * @param n Thread-local node
+         */
         void leave(Node* n)
         {
             if (!n)
@@ -74,6 +105,11 @@ namespace arch
             n->epoch.store(kInactiveEpoch, std::memory_order_release);
         }
 
+        /**
+         * @brief Retire pointer for later deletion
+         * @tparam T Type of pointer
+         * @param ptr Pointer to retire
+         */
         template <typename T>
         void retire(T* ptr)
         {
@@ -171,14 +207,26 @@ namespace arch
         static constexpr uint64_t kInactiveEpoch = std::numeric_limits<uint64_t>::max();
     };
 
-    // Topic: stores raw pointers to SubscriberSlot in hot-path vector to avoid shared_ptr refcounting.
+    /**
+     * @brief Topic for publishing and subscribing to messages
+     * @ingroup arch_experimental
+     * @tparam MessageT Type of message data
+     *
+     * Stores raw pointers to SubscriberSlot in hot-path vector to avoid shared_ptr refcounting.
+     * Uses copy-on-write (COW) for lock-free subscriber list updates.
+     */
     template <typename MessageT>
     class Topic : public std::enable_shared_from_this<Topic<MessageT>>
     {
     public:
-        using SubscriberSlotPtr = std::shared_ptr<SubscriberSlot<MessageT>>;
-        using SubscriberSlotRaw = SubscriberSlot<MessageT>*;
+        using SubscriberSlotPtr = std::shared_ptr<SubscriberSlot<MessageT>>;    ///< Shared pointer to subscriber slot
+        using SubscriberSlotRaw = SubscriberSlot<MessageT>*;                    ///< Raw pointer to subscriber slot
 
+        /**
+         * @brief Constructs topic
+         * @param name Topic name
+         * @param default_qos Default QoS settings
+         */
         Topic(const std::string& name, const QoS& default_qos)
         : name_(name), default_qos_(default_qos), destroyed_(false), slots_ptr_(nullptr), wake_ptr_(nullptr), rr_index_(0)
         {
@@ -197,9 +245,16 @@ namespace arch
                 EpochReclaimer::instance().retire(reinterpret_cast<std::function<void()>*>(wp));
         }
 
+        /**
+         * @brief Get topic name
+         * @return Topic name string
+         */
         std::string name() const { return name_; }
 
-        // set wake callback — atomically swap pointer to heap-allocated std::function
+        /**
+         * @brief Set wake callback (atomically swap pointer to heap-allocated std::function)
+         * @param cb Callback function to call when message is published
+         */
         void set_wake_callback(std::function<void()> cb)
         {
             auto new_cb = new std::function<void()>(std::move(cb));
@@ -208,7 +263,15 @@ namespace arch
                 EpochReclaimer::instance().retire(reinterpret_cast<std::function<void()>*>(old));
         }
 
-        // subscribe: create slot (shared_ptr owner returned to caller), push raw pointer to internal vector (COW)
+        /**
+         * @brief Subscribe to topic
+         * @param callback Callback function to execute when message is received
+         * @param group Callback group for thread synchronization (can be nullptr)
+         * @param qos Quality of Service settings
+         * @param consumer_group Consumer group identifier (for SingleConsumer delivery)
+         * @return Shared pointer to subscriber slot
+         * @note Creates slot (shared_ptr owner returned to caller), pushes raw pointer to internal vector (COW)
+         */
         SubscriberSlotPtr subscribe(
             std::function<void(MessagePtr<MessageT>)> callback,
             std::shared_ptr<CallbackGroup> group = nullptr,
@@ -239,6 +302,10 @@ namespace arch
             return slot;
         }
 
+        /**
+         * @brief Unsubscribe from topic
+         * @param slot Subscriber slot to unsubscribe
+         */
         void unsubscribe(const SubscriberSlotPtr& slot)
         {
             if (!slot || destroyed_.load(std::memory_order_acquire))
@@ -263,7 +330,12 @@ namespace arch
             }
         }
 
-        // publish: single atomic load of slots pointer + iteration over raw pointers; minimal overhead
+        /**
+         * @brief Publish message to all subscribers
+         * @param msg Message to publish
+         * @return true if published successfully, false otherwise
+         * @note Single atomic load of slots pointer + iteration over raw pointers; minimal overhead
+         */
         bool publish(MessagePtr<MessageT> msg)
         {
             if (!msg || destroyed_.load(std::memory_order_acquire))
@@ -360,6 +432,6 @@ namespace arch
         std::atomic<uint64_t> rr_index_;
     };
 
-}    // namespace arch
+}    // namespace arch::experimental
 
 #endif    // ARCH_COMM_TOPIC_H

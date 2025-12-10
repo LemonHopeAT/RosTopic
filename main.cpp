@@ -19,7 +19,7 @@
 #define TEST_BECH
 
 using namespace std::chrono_literals;
-using namespace arch;
+using namespace arch::experimental;
 
 //======================================================================================
 // Publisher ----> Topic ----> SubscriberSlot (MPSC queue) ----> Executor ----> callback
@@ -1309,11 +1309,29 @@ int main()
 
         std::vector<Benchmark::BenchmarkResult> all_results;
 
-        for (size_t i = 0; i < 100000; ++i)
+        // Запускаем бенчмарки в цикле с усреднением
+        // Каждый тест запускается несколько раз и усредняется
+        const size_t iterations_per_test = 3;  // Количество итераций для усреднения каждого теста
+        const size_t total_cycles = 100000;    // Общее количество циклов
+
+        for (size_t i = 0; i < total_cycles; ++i)
         {
-            std::cout << "Try #: " << i << std::endl;
-            auto results = Benchmark::run_all_benchmarks();
+            std::cout << "\n========================================\n";
+            std::cout << "Cycle #: " << i << " / " << total_cycles << "\n";
+            std::cout << "========================================\n";
+            
+            // run_all_benchmarks теперь принимает параметр iterations_per_test
+            // и усредняет результаты внутри
+            auto results = Benchmark::run_all_benchmarks(iterations_per_test);
             all_results.insert(all_results.end(), results.begin(), results.end());
+            
+            // Сохраняем промежуточные результаты каждые 10 циклов
+            if ((i + 1) % 10 == 0)
+            {
+                std::string filename = "benchmark_summary_cycle_" + std::to_string(i + 1) + ".csv";
+                Benchmark::save_results_to_csv(all_results, filename);
+                std::cout << "\nIntermediate results saved to: " << filename << "\n";
+            }
         }
 
         // Суммарный вывод и CSV
