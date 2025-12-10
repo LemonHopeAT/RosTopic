@@ -12,14 +12,11 @@
 #include <iostream>
 #include <vector>
 
-#include "include/NodeAdapter.h"
-
 //#define TEST_0
 //#define TEST_1
 //#define TEST_2
 //#define TEST_3
 #define TEST_BECH
-//#define TEST_ROS_ADAPTER
 
 using namespace std::chrono_literals;
 using namespace arch;
@@ -1339,43 +1336,4 @@ int main()
         return 1;
     }
 }
-#endif
-
-#ifdef TEST_ROS_ADAPTER
-
-struct MyMsg
-{
-    int data;
-    MyMsg() = default;
-    explicit MyMsg(int d) : data(d) {}
-};
-
-int main()
-{
-    using namespace std::chrono_literals;
-
-    // Создаём Node (можно как локальный объект)
-    rclcpp_compat::NodeOptions opts;
-    rclcpp_compat::Node node("demo_node", "/demo_ns", opts);
-
-    // Используем существующий arch::QoS (заменил rostopic::QoSProfile)
-    auto pub = node.create_publisher<MyMsg>("chatter", arch::QoS::BestEffort(10));
-    auto sub = node.create_subscription<MyMsg>(
-        "chatter",
-        [](std::shared_ptr<const MyMsg> msg) {
-            if (msg)
-                std::cerr << "Got msg: " << msg->data << "\n";
-        },
-        arch::QoS::BestEffort(10));
-
-    // Пример публикации
-    MyMsg m{42};
-    pub->publish(std::move(m));
-
-    // Небольшая пауза чтобы дать время доставке/обработке (в зависимости от реализации Executor/Topic)
-    std::this_thread::sleep_for(100ms);
-
-    return 0;
-}
-
 #endif

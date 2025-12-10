@@ -1,81 +1,50 @@
+#pragma once
 #ifndef ARCH_COMM_SUBSCRIBER_SLOT_H
 #define ARCH_COMM_SUBSCRIBER_SLOT_H
 
 #include "CallbackGroup.h"
 #include "IMessage.h"
 #include "Qos.h"
-//#include "arch/concurrency/lock_free_mpsc_queue.h"
-//#include "arch/concurrency/lock_free_spsc_queue.h"
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
-#include <string>
-
-#include <arch/utils.h>
-
-#include <deque>
-
-#include <atomic>
-#include <cassert>
-#include <cstddef>
-#include <optional>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
 
-using std::chrono_literals::operator""ms;
 namespace arch
 {
+
+    // Vyukov MPMC bounded queue (T must be move-assignable / copy-assignable).
+    // Uses standard sequence-based algorithm with acquire/release ordering.
+    // Works well with T = MessagePtr<TMsg> (std::shared_ptr), because shared_ptr copy/assign is thread-safe.
     template <typename T>
     class LockFreeMPMCQueue
     {
         static_assert(std::is_move_constructible<T>::value && std::is_move_assignable<T>::value,
                       "T must be move-constructible and move-assignable");
 
-    private:
-        // cache-line sized cell to avoid false sharing between seq and data
-        struct alignas(64) Cell
+        struct Cell
         {
-            std::atomic_size_t seq;
+            std::atomic<size_t> seq;
             T data;
         };
 
-        const size_t capacity_;
-        const size_t mask_;
-        std::vector<Cell> buffer_;
-
-        // Put these on separate cache lines to avoid false-sharing between producers/consumers
-        alignas(64) std::atomic_size_t enqueue_pos_{0};
-        char pad0[64 - sizeof(std::atomic_size_t) > 0 ? 64 - sizeof(std::atomic_size_t) : 1];
-
-        alignas(64) std::atomic_size_t dequeue_pos_{0};
-        char pad1[64 - sizeof(std::atomic_size_t) > 0 ? 64 - sizeof(std::atomic_size_t) : 1];
-
-        // helper: round up to next power of two
-        static size_t round_up_pow2(size_t x)
-        {
-            if (x == 0)
-                return 1;
-            --x;
-            for (size_t i = 1; i < sizeof(size_t) * 8; i <<= 1)
-                x |= x >> i;
-            return ++x;
-        }
-
     public:
         explicit LockFreeMPMCQueue(size_t capacity)
-        : capacity_(round_up_pow2(capacity)),
-          mask_(capacity_ - 1),
-          buffer_(capacity_)
+        : capacity_(round_up_pow2(capacity)), mask_(capacity_ - 1), buffer_(capacity_)
         {
             if (capacity == 0)
                 throw std::invalid_argument("capacity must be > 0");
-
-            // init sequence numbers
             for (size_t i = 0; i < capacity_; ++i)
-            {
                 buffer_[i].seq.store(i, std::memory_order_relaxed);
-            }
+            enqueue_pos_.store(0, std::memory_order_relaxed);
+            dequeue_pos_.store(0, std::memory_order_relaxed);
         }
 
         LockFreeMPMCQueue(const LockFreeMPMCQueue&) = delete;
@@ -83,8 +52,15 @@ namespace arch
 
         ~LockFreeMPMCQueue() = default;
 
-        // non-blocking try_push: returns true if pushed, false if queue full
-        bool push(const T& item)
+        // try to push (copy)
+        bool push(const T& item) { return emplace(item); }
+
+        // try to push (move)
+        bool push(T&& item) { return emplace(std::move(item)); }
+
+        // emplace: non-blocking; returns false if full
+        template <typename... Args>
+        bool emplace(Args&&... args)
         {
             size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
             for (;;)
@@ -96,14 +72,13 @@ namespace arch
                 {
                     if (enqueue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed))
                     {
-                        cell.data = item;
+                        // construct/assign in-place
+                        cell.data = T(std::forward<Args>(args)...);
+                        // publish: make data visible before seq update
                         cell.seq.store(pos + 1, std::memory_order_release);
                         return true;
                     }
-                    else
-                    {
-                        continue;
-                    }
+                    // else retry with updated pos
                 }
                 else if (dif < 0)
                 {
@@ -112,46 +87,13 @@ namespace arch
                 }
                 else
                 {
-                    pos = enqueue_pos_.load(std::memory_order_relaxed);
+                    pos = enqueue_pos_.load(std::memory_order_relaxed);    // retry with fresh tail
                 }
             }
         }
 
-        bool push(T&& item)
-        {
-            size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
-            for (;;)
-            {
-                Cell& cell   = buffer_[pos & mask_];
-                size_t seq   = cell.seq.load(std::memory_order_acquire);
-                intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-                if (dif == 0)
-                {
-                    if (enqueue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed))
-                    {
-                        cell.data = std::move(item);
-                        cell.seq.store(pos + 1, std::memory_order_release);
-                        return true;
-                    }
-                    else
-                    {
-                        continue;
-                    }
-                }
-                else if (dif < 0)
-                {
-                    std::this_thread::sleep_for(1ms);
-                    // return false;
-                }
-                else
-                {
-                    pos = enqueue_pos_.load(std::memory_order_relaxed);
-                }
-            }
-        }
-
-        // non-blocking try_pop: returns true if popped into 'out', false if empty
-        bool pop(T& out)
+        // try_pop: returns optional<T>
+        std::optional<T> pop()
         {
             size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
             for (;;)
@@ -163,20 +105,17 @@ namespace arch
                 {
                     if (dequeue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed))
                     {
-                        out = std::move(cell.data);
-                        // mark slot as free for next round (pos + capacity_)
+                        T res = std::move(cell.data);
+                        // mark slot as free for next round
                         cell.seq.store(pos + capacity_, std::memory_order_release);
-                        return true;
+                        return std::optional<T>(std::move(res));
                     }
-                    else
-                    {
-                        continue;
-                    }
+                    // else retry
                 }
                 else if (dif < 0)
                 {
                     // empty
-                    return false;
+                    return std::nullopt;
                 }
                 else
                 {
@@ -185,263 +124,251 @@ namespace arch
             }
         }
 
-        std::optional<T> pop()
+        bool empty() const
         {
-            T tmp;
-            if (pop(tmp))
-                return std::move(tmp);
-            return std::nullopt;
+            size_t head = dequeue_pos_.load(std::memory_order_acquire);
+            size_t tail = enqueue_pos_.load(std::memory_order_acquire);
+            return tail == head;
         }
 
-        // approximate size (may be racy)
+        // approximate current size (lock-free snapshot)
         size_t size() const
         {
-            size_t enq = enqueue_pos_.load(std::memory_order_acquire);
-            size_t deq = dequeue_pos_.load(std::memory_order_acquire);
-            return (enq >= deq) ? (enq - deq) : 0;
+            size_t head = dequeue_pos_.load(std::memory_order_acquire);
+            size_t tail = enqueue_pos_.load(std::memory_order_acquire);
+            if (tail >= head)
+                return tail - head;
+            // wrap-around guard (shouldn't normally happen for monotonic counters)
+            return (std::numeric_limits<size_t>::max() - head + tail + 1);
         }
+
         size_t capacity() const noexcept { return capacity_; }
-    };
-
-    template <typename T>
-    class MutexQueue
-    {
-    public:
-        MutexQueue(size_t /*capacity*/ = 1024) {}
-
-        // push возвращает true если успешно, false — при переполнении (мы не ограничиваем)
-        bool push(T v)
-        {
-            std::lock_guard<std::mutex> lk(m_);
-            q_.push_back(std::move(v));
-            return true;
-        }
-
-        // pop возвращает optional<T>
-        std::optional<T> pop()
-        {
-            std::lock_guard<std::mutex> lk(m_);
-            if (q_.empty())
-                return std::nullopt;
-            T v = std::move(q_.front());
-            q_.pop_front();
-            return v;
-        }
-
-        size_t size() const
-        {
-            std::lock_guard<std::mutex> lk(m_);
-            return q_.size();
-        }
 
     private:
-        mutable std::mutex m_;
-        std::deque<T> q_;
+        static size_t round_up_pow2(size_t x)
+        {
+            if (x == 0)
+                return 1;
+            --x;
+            for (size_t i = 1; i < sizeof(size_t) * 8; i <<= 1)
+                x |= x >> i;
+            return ++x;
+        }
+
+        const size_t capacity_;
+        const size_t mask_;
+        std::vector<Cell> buffer_;
+        alignas(64) std::atomic_size_t enqueue_pos_{0};
+        alignas(64) std::atomic_size_t dequeue_pos_{0};
     };
 
+    // SubscriberSlot: lock-free queue of MessagePtr<T>, safe invalidation of callback without heavy locks.
     template <typename MessageT>
     class SubscriberSlot final
     {
     public:
-        using Callback     = std::function<void(MessagePtr<MessageT>)>;
-        using MessageQueue = MutexQueue<MessagePtr<MessageT>>;
+        using MessagePtrT = MessagePtr<MessageT>;
+        using Callback    = std::function<void(MessagePtrT)>;
 
     private:
-        // Простой wrapper вокруг std::function с атомарным флагом
+        // SafeCallback: lightweight synchronization for callback lifetime.
+        // Idea: valid_ flag + ref_count. execute() increments ref_count (acq_rel),
+        // invalidate() sets valid_=false and waits until ref_count==0.
         class SafeCallback
         {
-        private:
-            Callback callback_;
-            std::atomic<bool> valid_{true};
-            std::atomic<int> ref_count_{0};    // Счетчик активных вызовов
-
         public:
             SafeCallback() = default;
-            explicit SafeCallback(Callback cb) : callback_(std::move(cb)) {}
+            explicit SafeCallback(Callback cb) : callback_(std::move(cb)), valid_(true), ref_count_(0) {}
 
             SafeCallback(const SafeCallback&) = delete;
             SafeCallback& operator=(const SafeCallback&) = delete;
-            SafeCallback(SafeCallback&&)                 = delete;
-            SafeCallback& operator=(SafeCallback&&) = delete;
 
-            ~SafeCallback() = default;
-
-            void execute(MessagePtr<MessageT> msg)
+            void execute(MessagePtrT msg)
             {
-                if (!valid_.load(std::memory_order_acquire) || !callback_)
+                // Fast-path check
+                if (!valid_.load(std::memory_order_acquire))
                     return;
 
+                // Increment active-call counter
                 ref_count_.fetch_add(1, std::memory_order_acq_rel);
 
+                // Re-check validity to handle the case where invalidate() happened between the first check and inc.
+                if (!valid_.load(std::memory_order_acquire))
+                {
+                    // decrement and bail out
+                    ref_count_.fetch_sub(1, std::memory_order_acq_rel);
+                    return;
+                }
+
+                // Call user callback (catch exceptions)
                 try
                 {
-                    callback_(std::move(msg));
+                    if (callback_)
+                        callback_(std::move(msg));
                 }
                 catch (...)
                 {
-                    // Игнорируем исключения
+                    // ignore
                 }
 
+                // Decrement active-call counter
                 ref_count_.fetch_sub(1, std::memory_order_acq_rel);
             }
 
             void invalidate()
             {
+                // Prevent further callers from entering
                 valid_.store(false, std::memory_order_release);
 
-                // Ждем завершения всех активных вызовов
+                // Wait until all active calls finish.
+                // Use backoff/yield to avoid busy spinning forever.
                 int spins = 0;
-                while (ref_count_.load(std::memory_order_acquire) > 0 && spins < 1000)
+                while (ref_count_.load(std::memory_order_acquire) != 0)
                 {
-                    spins++;
+                    ++spins;
+                    if (spins < 10)
+                    {
+                        // busy short pause
 #ifdef __x86_64__
-                    __builtin_ia32_pause();
+                        __builtin_ia32_pause();
 #endif
-                    arch::sleep_for(std::chrono::nanoseconds(100));
+                    }
+                    else if (spins < 100)
+                    {
+                        std::this_thread::yield();
+                    }
+                    else
+                    {
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
                 }
+                // Now safe to destroy/replace the std::function (caller will do it if needed).
+                // Note: we keep callback_ alive to allow destructor semantics if required.
+                // If you want to free callback_ memory here: callback_ = nullptr;
             }
 
-            bool valid() const
-            {
-                return valid_.load(std::memory_order_acquire);
-            }
+            bool valid() const { return valid_.load(std::memory_order_acquire); }
+
+        private:
+            Callback callback_;
+            std::atomic<bool> valid_{false};
+            std::atomic<int> ref_count_{0};
         };
 
-    private:
-        SafeCallback callback_;
-        std::shared_ptr<CallbackGroup> group_;
-        QoS qos_;
-        std::string consumer_group_;
-        MessageQueue queue_;
-        std::atomic<bool> destroyed_{false};
-
     public:
-        SubscriberSlot(Callback callback,
+        SubscriberSlot(Callback cb,
                        std::shared_ptr<CallbackGroup> group,
                        const QoS& qos,
                        const std::string& consumer_group = "")
-        : callback_(std::move(callback)), group_(std::move(group)), qos_(qos), consumer_group_(consumer_group), queue_(qos.history_depth)
+        : safe_cb_(std::move(cb)), group_(std::move(group)), qos_(qos), consumer_group_(consumer_group),
+          queue_(std::max<size_t>(64, qos.history_depth))
         {
+            // mark callback valid now that safe_cb_ constructed
+            // (safe_cb_ constructor sets valid_ to false by default, set true here)
+            // But we used constructor that sets true; if not, ensure:
+            // safe_cb_.set_callback(...); but in our impl it's true after construction
         }
 
-        // Запрещаем копирование
         SubscriberSlot(const SubscriberSlot&) = delete;
         SubscriberSlot& operator=(const SubscriberSlot&) = delete;
-
-        // Move запрещаем для простоты
-        SubscriberSlot(SubscriberSlot&&) = delete;
-        SubscriberSlot& operator=(SubscriberSlot&&) = delete;
 
         ~SubscriberSlot()
         {
             destroy();
         }
 
-        bool push_message(MessagePtr<MessageT> msg)
+        // push message into slot queue (called by Topic publish). Fast path, lock-free.
+        bool push_message(MessagePtrT msg)
         {
-            if (destroyed_.load(std::memory_order_acquire) || !callback_.valid())
+            if (destroyed_.load(std::memory_order_acquire))
                 return false;
-
-            // Если QoS надежный — доверяем очереди ответить что она полна.
-            // Убираем дополнительный вызов size() (дорого/погрешно для lock-free очереди).
-            if (qos_.reliability == QoS::Reliability::Reliable)
-            {
-                // попытка запушить — очередь сама вернёт false если полна
-                return queue_.push(std::move(msg));
-            }
-            else
-            {
-                // для BestEffort можем отбросить при переполнении
-                return queue_.push(std::move(msg));
-            }
+            // For reliable QoS we attempt push and return false if full.
+            // For best-effort, we also push and let caller decide on dropping.
+            return queue_.push(std::move(msg));
         }
 
-        std::optional<MessagePtr<MessageT>> pop_message()
+        // pop one message (used by Executor). Returns optional<MessagePtr<T>>
+        std::optional<MessagePtrT> pop_message()
         {
-            if (destroyed_.load(std::memory_order_acquire) || !callback_.valid())
+            if (destroyed_.load(std::memory_order_acquire))
                 return std::nullopt;
-
             return queue_.pop();
         }
 
-        void execute_callback(MessagePtr<MessageT> msg)    // Принимаем по значению!
+        // Execute callback with proper callback_group enter/leave
+        void execute_callback(MessagePtrT msg)
         {
-            if (destroyed_.load(std::memory_order_acquire) || !callback_.valid())
+            if (destroyed_.load(std::memory_order_acquire))
                 return;
-
+            if (!safe_cb_.valid())
+                return;
             if (!msg)
                 return;
 
-            try
+            if (group_)
             {
-                if (group_)
-                {
-                    group_->enter();
-                    try
-                    {
-                        callback_.execute(std::move(msg));    // Передаем владение
-                    }
-                    catch (...)
-                    {
-                        group_->leave();
-                        throw;
-                    }
-                    group_->leave();
-                }
-                else
-                {
-                    callback_.execute(std::move(msg));    // Передаем владение
-                }
+                group_->enter();
+                safe_cb_.execute(std::move(msg));
+                group_->leave();
             }
-            catch (...)
+            else
             {
-                // Игнорируем исключения в пользовательском коде
+                safe_cb_.execute(std::move(msg));
             }
         }
 
         bool has_messages() const
         {
-            return !destroyed_.load(std::memory_order_acquire) &&
-                   callback_.valid() &&
-                   queue_.size() > 0;
+            return !destroyed_.load(std::memory_order_acquire) && safe_cb_.valid() && !queue_.empty();
         }
 
         size_t queue_size() const
         {
-            if (destroyed_.load(std::memory_order_acquire) || !callback_.valid())
+            if (destroyed_.load(std::memory_order_acquire) || !safe_cb_.valid())
                 return 0;
             return queue_.size();
         }
+
+        size_t queue_capacity() const { return queue_.capacity(); }
 
         const QoS& qos() const { return qos_; }
         const std::string& consumer_group() const { return consumer_group_; }
         std::shared_ptr<CallbackGroup> group() const { return group_; }
 
-        bool valid() const
-        {
-            return !destroyed_.load(std::memory_order_acquire) && callback_.valid();
-        }
+        bool valid() const { return !destroyed_.load(std::memory_order_acquire) && safe_cb_.valid(); }
 
         void destroy()
         {
-            // Устанавливаем флаг destroyed
-            destroyed_.store(true, std::memory_order_release);
+            bool expected = false;
+            if (!destroyed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+                return;
 
-            // Инвалидируем callback (он сам ждет завершения вызовов)
-            callback_.invalidate();
+            // Prevent further callback entries and wait for active callers to finish
+            safe_cb_.invalidate();
 
-            // Очищаем очередь
+            // drain queue to release messages (shared_ptrs)
             clear_queue();
         }
 
     private:
         void clear_queue()
         {
-            while (auto msg = queue_.pop())
+            while (true)
             {
-                // Освобождаем сообщения
+                auto maybe = queue_.pop();
+                if (!maybe.has_value())
+                    break;
+                // let shared_ptr go out of scope
             }
         }
+
+    private:
+        SafeCallback safe_cb_;
+        std::shared_ptr<CallbackGroup> group_;
+        QoS qos_;
+        std::string consumer_group_;
+        LockFreeMPMCQueue<MessagePtrT> queue_;
+        std::atomic<bool> destroyed_{false};
     };
 
 }    // namespace arch

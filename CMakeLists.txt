@@ -40,7 +40,6 @@ add_executable(ROS_TOPIC
     include/Topic.h
     include/WaitSet.h
 
-    include/NodeAdapter.h
 
     include/Benchmark.h
   main.cpp
