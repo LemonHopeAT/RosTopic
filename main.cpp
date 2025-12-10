@@ -18,8 +18,8 @@
 //#define TEST_1
 //#define TEST_2
 //#define TEST_3
-//#define TEST_BECH
-#define TEST_ROS_ADAPTER
+#define TEST_BECH
+//#define TEST_ROS_ADAPTER
 
 using namespace std::chrono_literals;
 using namespace arch;
