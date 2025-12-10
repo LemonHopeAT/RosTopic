@@ -1,3 +1,4 @@
+
 #ifndef ARCH_COMM_TOPIC_H
 #define ARCH_COMM_TOPIC_H
 
@@ -16,53 +17,63 @@
 namespace arch
 {
 
-    // Simple thread registry + epoch-based reclamation helper.
-    // Optimized for fast reader path: readers only do atomic load of slots_ptr_ and
-    // set/reset their thread-local epoch number (no locks).
+    // EpochReclaimer: lock-free registration via singly-linked list of per-thread nodes.
+    // Each thread allocates one Node and pushes it to head_ on first register.
+    // Readers call enter(node)/leave(node) using their thread-local node pointer.
     class EpochReclaimer
     {
     public:
-        // singleton access
+        struct Node
+        {
+            std::atomic<uint64_t> epoch;
+            Node* next;
+            Node(uint64_t v) : epoch(v), next(nullptr) {}
+        };
+
         static EpochReclaimer& instance()
         {
             static EpochReclaimer inst;
             return inst;
         }
 
-        // Register current thread and return index to use for epoch array.
-        // Uses mutex only on first-time registration for this thread.
-        size_t register_thread()
+        // Return thread-local Node*; create and push to list on first call (lock-free push_front).
+        Node* register_thread()
         {
-            // thread-local index, initialized on first call in this thread
-            static thread_local size_t t_index = SIZE_MAX;
-            if (t_index != SIZE_MAX)
-                return t_index;
+            static thread_local Node* t_node = nullptr;
+            if (t_node)
+                return t_node;
 
-            std::lock_guard<std::mutex> lk(reg_mutex_);
-            // assign index and allocate an atomic epoch for this thread
-            t_index = epochs_.size();
-            epochs_.push_back(new std::atomic<uint64_t>(kInactiveEpoch));
-            return t_index;
+            Node* n = new Node(kInactiveEpoch);
+
+            // push front: lock-free CAS on head_
+            Node* old_head = head_.load(std::memory_order_acquire);
+            for (;;)
+            {
+                n->next = old_head;
+                if (head_.compare_exchange_weak(old_head, n, std::memory_order_release, std::memory_order_acquire))
+                    break;
+                // old_head updated by CAS failure; retry
+            }
+
+            t_node = n;
+            return t_node;
         }
 
-        // Called by reader threads when entering critical section (short-lived).
-        void enter(size_t idx)
+        void enter(Node* n)
         {
-            if (idx >= epochs_.size())
+            if (!n)
                 return;
             uint64_t g = global_epoch_.load(std::memory_order_acquire);
-            epochs_[idx]->store(g, std::memory_order_release);
+            n->epoch.store(g, std::memory_order_release);
         }
 
-        // Called by reader threads on exit.
-        void leave(size_t idx)
+        void leave(Node* n)
         {
-            if (idx >= epochs_.size())
+            if (!n)
                 return;
-            epochs_[idx]->store(kInactiveEpoch, std::memory_order_release);
+            n->epoch.store(kInactiveEpoch, std::memory_order_release);
         }
 
-        // Retire a pointer together with current epoch.
         template <typename T>
         void retire(T* ptr)
         {
@@ -79,7 +90,7 @@ namespace arch
 
         ~EpochReclaimer()
         {
-            // free remaining retired items
+            // free retired
             std::vector<RetiredItem> to_free;
             {
                 std::lock_guard<std::mutex> lk(retired_mutex_);
@@ -89,11 +100,15 @@ namespace arch
                 if (it.deleter)
                     it.deleter(it.ptr);
 
-            // delete epoch atomics
-            std::lock_guard<std::mutex> lk(reg_mutex_);
-            for (auto p : epochs_)
-                delete p;
-            epochs_.clear();
+            // delete nodes in linked list
+            Node* cur = head_.load(std::memory_order_acquire);
+            while (cur)
+            {
+                Node* next = cur->next;
+                delete cur;
+                cur = next;
+            }
+            head_.store(nullptr, std::memory_order_relaxed);
         }
 
     private:
@@ -102,22 +117,21 @@ namespace arch
         void try_reclaim()
         {
             uint64_t min_epoch = std::numeric_limits<uint64_t>::max();
+
+            // scan linked list for min epoch (safe: list nodes are stable)
+            Node* cur = head_.load(std::memory_order_acquire);
+            while (cur)
             {
-                // snapshot epochs (vector growth protected by reg_mutex_)
-                std::lock_guard<std::mutex> lk(reg_mutex_);
-                for (auto p : epochs_)
-                {
-                    uint64_t v = p->load(std::memory_order_acquire);
-                    if (v < min_epoch)
-                        min_epoch = v;
-                }
+                uint64_t v = cur->epoch.load(std::memory_order_acquire);
+                if (v < min_epoch)
+                    min_epoch = v;
+                cur = cur->next;
             }
 
-            // if no threads registered, min_epoch == max then we can reclaim everything
             if (min_epoch == std::numeric_limits<uint64_t>::max())
                 min_epoch = global_epoch_.load(std::memory_order_acquire);
 
-            // move reclaimable to local vector to free without holding retired_mutex_ too long
+            // move reclaimable to local vector to free without holding retired_mutex_
             std::vector<RetiredItem> to_free;
             {
                 std::lock_guard<std::mutex> lk(retired_mutex_);
@@ -135,10 +149,8 @@ namespace arch
             }
 
             for (auto& item : to_free)
-            {
                 if (item.deleter)
                     item.deleter(item.ptr);
-            }
         }
 
         struct RetiredItem
@@ -150,47 +162,53 @@ namespace arch
         };
 
         std::atomic<uint64_t> global_epoch_{1};
-        std::mutex reg_mutex_;
-        // store pointers to atomics because std::atomic is not copyable/movable
-        std::vector<std::atomic<uint64_t>*> epochs_;    // per-thread epochs, kInactiveEpoch when not in critical section
+
+        // head of singly-linked list of Node*, each node allocated once per thread and not moved until program end
+        std::atomic<Node*> head_{nullptr};
 
         std::mutex retired_mutex_;
         std::vector<RetiredItem> retired_;
-
         static constexpr uint64_t kInactiveEpoch = std::numeric_limits<uint64_t>::max();
     };
 
+    // Topic: stores raw pointers to SubscriberSlot in hot-path vector to avoid shared_ptr refcounting.
     template <typename MessageT>
     class Topic : public std::enable_shared_from_this<Topic<MessageT>>
     {
     public:
-        using SubscriberSlotPtr     = std::shared_ptr<SubscriberSlot<MessageT>>;
-        using WeakSubscriberSlotPtr = std::weak_ptr<SubscriberSlot<MessageT>>;
+        using SubscriberSlotPtr = std::shared_ptr<SubscriberSlot<MessageT>>;
+        using SubscriberSlotRaw = SubscriberSlot<MessageT>*;
 
         Topic(const std::string& name, const QoS& default_qos)
-        : name_(name), default_qos_(default_qos), destroyed_(false), slots_ptr_(nullptr), rr_index_(0)
+        : name_(name), default_qos_(default_qos), destroyed_(false), slots_ptr_(nullptr), wake_ptr_(nullptr), rr_index_(0)
         {
-            // initial empty vector
-            auto vec = new std::vector<SubscriberSlotPtr>();
+            auto vec = new std::vector<SubscriberSlotRaw>();
             slots_ptr_.store(vec, std::memory_order_release);
         }
 
         ~Topic()
         {
             destroy();
-            auto ptr = slots_ptr_.exchange(nullptr, std::memory_order_acq_rel);
-            if (ptr)
-                EpochReclaimer::instance().retire(ptr);
-        }
-
-        void set_wake_callback(std::function<void()> cb)
-        {
-            std::lock_guard<std::mutex> lk(wake_mutex_);
-            wake_cb_ = std::move(cb);
+            auto p = slots_ptr_.exchange(nullptr, std::memory_order_acq_rel);
+            if (p)
+                EpochReclaimer::instance().retire(p);
+            auto wp = wake_ptr_.exchange(nullptr, std::memory_order_acq_rel);
+            if (wp)
+                EpochReclaimer::instance().retire(reinterpret_cast<std::function<void()>*>(wp));
         }
 
         std::string name() const { return name_; }
 
+        // set wake callback — atomically swap pointer to heap-allocated std::function
+        void set_wake_callback(std::function<void()> cb)
+        {
+            auto new_cb = new std::function<void()>(std::move(cb));
+            void* old   = wake_ptr_.exchange(reinterpret_cast<void*>(new_cb), std::memory_order_acq_rel);
+            if (old)
+                EpochReclaimer::instance().retire(reinterpret_cast<std::function<void()>*>(old));
+        }
+
+        // subscribe: create slot (shared_ptr owner returned to caller), push raw pointer to internal vector (COW)
         SubscriberSlotPtr subscribe(
             std::function<void(MessagePtr<MessageT>)> callback,
             std::shared_ptr<CallbackGroup> group = nullptr,
@@ -205,24 +223,19 @@ namespace arch
             if (qos.delivery == QoS::Delivery::Broadcast)
                 qos.delivery = default_qos_.delivery;
 
-            auto slot = std::make_shared<SubscriberSlot<MessageT>>(std::move(callback), std::move(group), qos, consumer_group);
-
-            // copy-on-write insertion with atomic ptr swap
-            std::vector<SubscriberSlotPtr>* old_ptr = slots_ptr_.load(std::memory_order_acquire);
+            auto slot                               = std::make_shared<SubscriberSlot<MessageT>>(std::move(callback), std::move(group), qos, consumer_group);
+            std::vector<SubscriberSlotRaw>* old_ptr = slots_ptr_.load(std::memory_order_acquire);
             for (;;)
             {
-                auto new_vec = new std::vector<SubscriberSlotPtr>(*old_ptr);
-                new_vec->push_back(slot);
+                auto new_vec = new std::vector<SubscriberSlotRaw>(*old_ptr);
+                new_vec->push_back(slot.get());
                 if (slots_ptr_.compare_exchange_weak(old_ptr, new_vec, std::memory_order_release, std::memory_order_acquire))
                 {
-                    // retire old vector safely
                     EpochReclaimer::instance().retire(old_ptr);
                     break;
                 }
-                // CAS failed: old_ptr updated to current, retry
                 delete new_vec;
             }
-
             return slot;
         }
 
@@ -230,16 +243,15 @@ namespace arch
         {
             if (!slot || destroyed_.load(std::memory_order_acquire))
                 return;
-
             slot->destroy();
 
-            std::vector<SubscriberSlotPtr>* old_ptr = slots_ptr_.load(std::memory_order_acquire);
+            std::vector<SubscriberSlotRaw>* old_ptr = slots_ptr_.load(std::memory_order_acquire);
             for (;;)
             {
-                auto new_vec = new std::vector<SubscriberSlotPtr>();
+                auto new_vec = new std::vector<SubscriberSlotRaw>();
                 new_vec->reserve(old_ptr->size());
-                for (auto& s : *old_ptr)
-                    if (s && s != slot)
+                for (auto s : *old_ptr)
+                    if (s && s != slot.get())
                         new_vec->push_back(s);
 
                 if (slots_ptr_.compare_exchange_weak(old_ptr, new_vec, std::memory_order_release, std::memory_order_acquire))
@@ -251,31 +263,25 @@ namespace arch
             }
         }
 
-        // publish: fast path, lock-free reading of slots pointer
+        // publish: single atomic load of slots pointer + iteration over raw pointers; minimal overhead
         bool publish(MessagePtr<MessageT> msg)
         {
             if (!msg || destroyed_.load(std::memory_order_acquire))
                 return false;
 
-            // register thread with reclaimer lazily
-            size_t tidx = EpochReclaimer::instance().register_thread();
+            auto node = EpochReclaimer::instance().register_thread();
+            EpochReclaimer::instance().enter(node);
 
-            // enter epoch -- mark ourselves as active
-            EpochReclaimer::instance().enter(tidx);
-
-            // load current slots pointer once
-            std::vector<SubscriberSlotPtr>* slots = slots_ptr_.load(std::memory_order_acquire);
+            auto slots = slots_ptr_.load(std::memory_order_acquire);
             if (!slots || slots->empty())
             {
-                EpochReclaimer::instance().leave(tidx);
+                EpochReclaimer::instance().leave(node);
                 return false;
             }
 
-            // Delivery policy
             if (default_qos_.delivery == QoS::Delivery::Broadcast)
             {
-                // broadcast to all subscribers
-                for (auto& s : *slots)
+                for (auto s : *slots)
                 {
                     if (s)
                         s->push_message(msg);
@@ -285,25 +291,20 @@ namespace arch
             {
                 size_t idx = rr_index_.fetch_add(1, std::memory_order_relaxed);
                 idx        = idx % slots->size();
-                auto& s    = (*slots)[idx];
+                auto s     = (*slots)[idx];
                 if (s)
                     s->push_message(msg);
             }
 
-            // leave epoch
-            EpochReclaimer::instance().leave(tidx);
+            EpochReclaimer::instance().leave(node);
 
-            // call wake callback (if set) without holding epoch
-            std::function<void()> cb;
-            {
-                std::lock_guard<std::mutex> lk(wake_mutex_);
-                cb = wake_cb_;
-            }
-            if (cb)
+            // wake callback: atomic load of function pointer and direct call (no mutex)
+            auto wp = reinterpret_cast<std::function<void()>*>(wake_ptr_.load(std::memory_order_acquire));
+            if (wp && *wp)
             {
                 try
                 {
-                    cb();
+                    (*wp)();
                 }
                 catch (...)
                 {
@@ -313,12 +314,12 @@ namespace arch
             return true;
         }
 
-        std::vector<SubscriberSlotPtr> get_slots() const
+        std::vector<SubscriberSlotRaw> get_slots() const
         {
-            auto ptr = slots_ptr_.load(std::memory_order_acquire);
-            if (!ptr)
+            auto p = slots_ptr_.load(std::memory_order_acquire);
+            if (!p)
                 return {};
-            return *ptr;
+            return *p;
         }
 
         void destroy()
@@ -327,31 +328,25 @@ namespace arch
             if (!destroyed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
                 return;
 
-            // exchange pointer with empty vector and retire the old one
-            auto new_vec = new std::vector<SubscriberSlotPtr>();
+            auto new_vec = new std::vector<SubscriberSlotRaw>();
             auto old_ptr = slots_ptr_.exchange(new_vec, std::memory_order_acq_rel);
             if (old_ptr)
             {
-                // call destroy on slots to mark them dead
-                for (auto& s : *old_ptr)
-                {
+                for (auto s : *old_ptr)
                     if (s)
                         s->destroy();
-                }
                 EpochReclaimer::instance().retire(old_ptr);
             }
 
-            // clear wake callback
-            {
-                std::lock_guard<std::mutex> lk(wake_mutex_);
-                wake_cb_ = nullptr;
-            }
+            auto old_w = wake_ptr_.exchange(nullptr, std::memory_order_acq_rel);
+            if (old_w)
+                EpochReclaimer::instance().retire(reinterpret_cast<std::function<void()>*>(old_w));
         }
 
         size_t subscriber_count() const
         {
-            auto ptr = slots_ptr_.load(std::memory_order_acquire);
-            return ptr ? ptr->size() : 0;
+            auto p = slots_ptr_.load(std::memory_order_acquire);
+            return p ? p->size() : 0;
         }
 
     private:
@@ -359,15 +354,9 @@ namespace arch
         QoS default_qos_;
         std::atomic<bool> destroyed_{false};
 
-        // atomic raw pointer to vector<shared_ptr<SubscriberSlot<T>>>.
-        // Writers swap with new vector and retire old pointer; readers just load pointer and iterate.
-        std::atomic<std::vector<SubscriberSlotPtr>*> slots_ptr_;
+        std::atomic<std::vector<SubscriberSlotRaw>*> slots_ptr_;    // raw-pointer to vector; retired via EpochReclaimer
+        std::atomic<void*> wake_ptr_;                               // atomic pointer to heap std::function<void()>, retired via EpochReclaimer
 
-        // wake callback and mutex for setting/calling it (we call callback without holding epoch)
-        std::function<void()> wake_cb_;
-        mutable std::mutex wake_mutex_;
-
-        // round-robin index for SingleConsumer delivery
         std::atomic<uint64_t> rr_index_;
     };
 
