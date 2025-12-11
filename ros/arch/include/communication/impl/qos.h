@@ -1,7 +1,7 @@
 /**
- * @file Qos.h
+ * @file qos.h
  * @brief Quality of Service settings for topics and subscribers
- * @date 2024
+ * @date 2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -96,4 +96,4 @@ namespace arch::experimental
     };
 }    // namespace arch::experimental
 
-#endif    // QOS_H
+#endif    // !QOS_H

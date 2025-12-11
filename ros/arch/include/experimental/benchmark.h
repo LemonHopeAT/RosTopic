@@ -1,7 +1,7 @@
 /**
- * @file Benchmark.h
+ * @file benchmark.h
  * @brief Benchmark utilities for testing ROS2-like messaging system
- * @date 2024
+ * @date 2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -9,12 +9,16 @@
 #ifndef ARCH_BENCHMARK_H
 #define ARCH_BENCHMARK_H
 
-#include "CallbackGroup.h"
-#include "Executor.h"
-#include "Publisher.h"
-#include "SubscriberSlot.h"
-#include "Topic.h"
-#include "arch/utils.h"
+#include <arch/utils.h>
+#include <arch/communication/imessage.h>
+#include "test_message.h"
+#include "../communication/impl/callback_group.h"
+#include "../communication/impl/executor.h"
+#include "../communication/impl/factory.h"
+#include "../communication/impl/publisher.h"
+#include "../communication/impl/subscriber_slot.h"
+#include "../communication/impl/subscription.h"
+#include "../communication/impl/topic.h"
 
 #include <algorithm>
 #include <atomic>
@@ -219,8 +223,7 @@ namespace arch::experimental
             result.messages_sent = message_count;
 
             auto executor = std::make_shared<Executor>(1);
-            auto topic    = std::make_shared<Topic<int>>("/benchmark/spsc", QoS::Reliable(1000));
-            executor->add_topic(topic);
+            auto factory  = std::make_shared<Factory>("benchmark_spsc_factory");
 
             std::atomic<size_t> received_count{0};
             std::atomic<size_t> dropped_count{0};
@@ -230,23 +233,39 @@ namespace arch::experimental
             auto callback_group = std::make_shared<CallbackGroup>(
                 CallbackGroup::Type::Reentrant, "benchmark_spsc");
 
-            auto slot = topic->subscribe(
-                [&received_count, &receive_times, message_count](auto msg) {
+            // Create subscription through Factory (ROS2-like API) - using TestMessage for benchmarking
+            auto subscription_void = factory->createSubscription<arch::experimental::TestMessage<int>>(
+                "/benchmark/spsc",
+                [&received_count, &receive_times, message_count](message_ptr<const IMessage> msg) {
                     // Всегда увеличиваем счетчик полученных сообщений
                     received_count++;
 
-                    // Сохраняем время получения только для валидных индексов
-                    if (msg && msg->data >= 0 && msg->data < static_cast<int>(message_count))
+                    // Получаем конкретный тип сообщения из IMessagePtr
+                    auto int_msg = std::dynamic_pointer_cast<const arch::experimental::TestMessage<int>>(msg);
+                    if (int_msg && int_msg->data >= 0 && int_msg->data < static_cast<int>(message_count))
                     {
-                        size_t idx = static_cast<size_t>(msg->data);
+                        size_t idx = static_cast<size_t>(int_msg->data);
                         if (idx < receive_times.size())
                         {
                             receive_times[idx] = std::chrono::high_resolution_clock::now();
                         }
                     }
                 },
-                callback_group,
-                QoS::Reliable(1000));
+                QoS::Reliable(1000),
+                callback_group);
+            
+            // Cast to Subscription<TestMessage<int>> for compatibility
+            auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<int>>>(subscription_void);
+
+            // Create publisher through Factory (ROS2-like API) - using TestMessage for benchmarking
+            auto publisher = factory->createPublisher<arch::experimental::TestMessage<int>>("/benchmark/spsc", QoS::Reliable(1000));
+
+            // Get topic from Factory and add to executor
+            auto topic = factory->getTopic<arch::experimental::TestMessage<int>>("/benchmark/spsc");
+            if (topic)
+            {
+                executor->add_topic(topic);
+            }
 
             executor->start();
 
@@ -255,16 +274,20 @@ namespace arch::experimental
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));    // warm-up (уменьшено)
 
-            Publisher<int> publisher(topic);
+            // Get slot from subscription for queue size monitoring
+            auto slot = subscription ? subscription->getSlot() : nullptr;
+
             for (size_t i = 0; i < message_count; ++i)
             {
-                if (!publisher.publish(static_cast<int>(i)))
+                if (!publisher || !publisher->publish(arch::experimental::TestMessage<int>(static_cast<int>(i))))
                     dropped_count++;
 
-                size_t queue_size = slot->queue_size();
-                if (queue_size > peak_queue.load())
-                    peak_queue.store(queue_size);
-                // Убрали yield для ускорения
+                if (slot)
+                {
+                    size_t queue_size = slot->queue_size();
+                    if (queue_size > peak_queue.load())
+                        peak_queue.store(queue_size);
+                }
             }
 
             // Оптимизированное ожидание обработки всех сообщений
@@ -277,7 +300,7 @@ namespace arch::experimental
             {
                 executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено с 10
 
-                size_t current_queue_size = slot->queue_size();
+                size_t current_queue_size = slot ? slot->queue_size() : 0;
                 size_t current_received   = received_count.load();
 
                 // Проверяем прогресс
@@ -304,15 +327,15 @@ namespace arch::experimental
             }
 
             // Уменьшенная финальная обработка
-            for (int i = 0; i < 50 && (received_count < message_count || slot->queue_size() > 0); ++i)    // Уменьшено с 200
+            for (int i = 0; i < 50 && (received_count < message_count || (slot && slot->queue_size() > 0)); ++i)    // Уменьшено с 200
             {
                 executor->spin_once(std::chrono::milliseconds(5));
-                if (slot->queue_size() == 0 && received_count >= message_count)
+                if (slot && slot->queue_size() == 0 && received_count >= message_count)
                     break;
             }
 
             auto end_time = std::chrono::high_resolution_clock::now();
-            topic->destroy();
+            factory->destroy();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
@@ -369,11 +392,11 @@ namespace arch::experimental
             result.messages_sent = total_messages;
 
             auto executor = std::make_shared<Executor>(2);
+            auto factory  = std::make_shared<Factory>("benchmark_mpsc_factory");
+
             // Increase queue capacity to handle burst of messages from multiple producers
             // 4 producers * 25000 = 100000 messages, so we need at least that capacity
             const size_t queue_capacity = std::max<size_t>(100000, producer_count * messages_per_producer);
-            auto topic                  = std::make_shared<Topic<size_t>>("/benchmark/mpsc", QoS::Reliable(queue_capacity));
-            executor->add_topic(topic);
 
             std::atomic<size_t> received_count{0};
             std::atomic<size_t> dropped_count{0};
@@ -382,10 +405,29 @@ namespace arch::experimental
             auto callback_group = std::make_shared<CallbackGroup>(
                 CallbackGroup::Type::MutuallyExclusive, "benchmark_mpsc");
 
-            auto slot = topic->subscribe(
-                [&received_count](auto msg) { received_count++; },
-                callback_group,
-                QoS::Reliable(queue_capacity));
+            // Create subscription through Factory (ROS2-like API) - using TestMessage for benchmarking
+            auto subscription_void = factory->createSubscription<arch::experimental::TestMessage<size_t>>(
+                "/benchmark/mpsc",
+                [&received_count](message_ptr<const IMessage> msg) { 
+                    if (msg) {
+                        received_count++; 
+                    }
+                },
+                QoS::Reliable(queue_capacity),
+                callback_group);
+            
+            // Cast to Subscription<TestMessage<size_t>> for compatibility
+            auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<size_t>>>(subscription_void);
+
+            // Get topic from Factory and add to executor
+            auto topic = factory->getTopic<arch::experimental::TestMessage<size_t>>("/benchmark/mpsc");
+            if (topic)
+            {
+                executor->add_topic(topic);
+            }
+
+            // Get slot from subscription for queue size monitoring
+            auto slot = subscription ? subscription->getSlot() : nullptr;
 
             executor->start();
             size_t memory_before = get_current_memory_usage();
@@ -397,19 +439,24 @@ namespace arch::experimental
             std::thread monitor([&]() {
                 while (!stop_flag.load())
                 {
-                    size_t queue_size   = slot->queue_size();
-                    size_t current_peak = peak_queue.load();
-                    while (queue_size > current_peak)
-                        if (peak_queue.compare_exchange_weak(current_peak, queue_size))
-                            break;
+                    if (slot)
+                    {
+                        size_t queue_size   = slot->queue_size();
+                        size_t current_peak = peak_queue.load();
+                        while (queue_size > current_peak)
+                            if (peak_queue.compare_exchange_weak(current_peak, queue_size))
+                                break;
+                    }
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
             });
 
+            // Create publisher through Factory (ROS2-like API) - using TestMessage for benchmarking
+            auto publisher = factory->createPublisher<arch::experimental::TestMessage<size_t>>("/benchmark/mpsc", QoS::Reliable(queue_capacity));
+
             for (size_t p = 0; p < producer_count; ++p)
             {
-                producers.emplace_back([&, p]() {
-                    Publisher<size_t> publisher(topic);
+                producers.emplace_back([&, p, publisher]() {
                     size_t start_idx = p * messages_per_producer;
                     for (size_t i = 0; i < messages_per_producer; ++i)
                     {
@@ -418,7 +465,8 @@ namespace arch::experimental
                         int retries    = 0;
                         while (!published && retries < 5)
                         {
-                            published = publisher.publish(start_idx + i);
+                            if (publisher)
+                                published = publisher->publish(arch::experimental::TestMessage<size_t>(start_idx + i));
                             if (!published)
                             {
                                 std::this_thread::yield();
@@ -446,7 +494,7 @@ namespace arch::experimental
             {
                 executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено
 
-                if (slot->queue_size() == 0 && received_count < total_messages)
+                if (slot && slot->queue_size() == 0 && received_count < total_messages)
                 {
                     std::this_thread::sleep_for(std::chrono::microseconds(100));    // Уменьшено
                 }
@@ -463,7 +511,7 @@ namespace arch::experimental
                 monitor.join();
 
             auto end_time = std::chrono::high_resolution_clock::now();
-            topic->destroy();
+            factory->destroy();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
@@ -488,9 +536,7 @@ namespace arch::experimental
             result.messages_sent = iterations;
 
             auto executor = std::make_shared<Executor>(1);
-            auto topic    = std::make_shared<Topic<TimestampedMessage>>(
-                "/benchmark/latency", QoS::Reliable(1000));
-            executor->add_topic(topic);
+            auto factory  = std::make_shared<Factory>("benchmark_latency_factory");
 
             std::vector<double> latencies;
             latencies.reserve(iterations);
@@ -500,17 +546,20 @@ namespace arch::experimental
             auto callback_group = std::make_shared<CallbackGroup>(
                 CallbackGroup::Type::Reentrant, "latency_test");
 
-            auto slot = topic->subscribe(
-                [&](auto msg) {
+            // Create subscription through Factory (ROS2-like API) - using TestMessage for benchmarking
+            auto subscription_void = factory->createSubscription<arch::experimental::TestMessage<TimestampedMessage>>(
+                "/benchmark/latency",
+                [&](message_ptr<const IMessage> msg) {
                     // Всегда увеличиваем счетчик полученных сообщений
                     received++;
 
-                    // Сохраняем задержку только для валидных сообщений
-                    if (msg)
+                    // Получаем конкретный тип сообщения из IMessagePtr
+                    auto ts_msg = std::dynamic_pointer_cast<const arch::experimental::TestMessage<TimestampedMessage>>(msg);
+                    if (ts_msg)
                     {
                         auto end_time   = std::chrono::high_resolution_clock::now();
                         auto latency_ms = std::chrono::duration<double, std::milli>(
-                                              end_time - msg->data.send_time)
+                                              end_time - ts_msg->data.send_time)
                                               .count();
                         {
                             std::lock_guard<std::mutex> lock(latencies_mutex);
@@ -518,22 +567,37 @@ namespace arch::experimental
                         }
                     }
                 },
-                callback_group,
-                QoS::Reliable(1000));
+                QoS::Reliable(1000),
+                callback_group);
+            
+            // Cast to Subscription<TestMessage<TimestampedMessage>> for compatibility
+            auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<TimestampedMessage>>>(subscription_void);
+
+            // Create publisher through Factory (ROS2-like API) - using TestMessage for benchmarking
+            auto publisher = factory->createPublisher<arch::experimental::TestMessage<TimestampedMessage>>("/benchmark/latency", QoS::Reliable(1000));
+
+            // Get topic from Factory and add to executor
+            auto topic = factory->getTopic<arch::experimental::TestMessage<TimestampedMessage>>("/benchmark/latency");
+            if (topic)
+            {
+                executor->add_topic(topic);
+            }
+
+            // Get slot from subscription for queue size monitoring
+            auto slot = subscription ? subscription->getSlot() : nullptr;
 
             executor->start();
             size_t memory_before = get_current_memory_usage();
             std::this_thread::sleep_for(std::chrono::milliseconds(10));    // warm-up
             auto start_time = std::chrono::high_resolution_clock::now();
 
-            Publisher<TimestampedMessage> publisher(topic);
             std::atomic<size_t> publish_failures{0};
 
             for (size_t i = 0; i < iterations; ++i)
             {
-                TimestampedMessage msg;
-                msg.send_time = std::chrono::high_resolution_clock::now();
-                msg.index     = i;
+                TimestampedMessage msg_data;
+                msg_data.send_time = std::chrono::high_resolution_clock::now();
+                msg_data.index     = i;
 
                 // Retry logic for reliable QoS
                 int retries           = 0;
@@ -541,7 +605,8 @@ namespace arch::experimental
                 bool published        = false;
                 while (retries < max_retries && !published)
                 {
-                    published = publisher.publish(msg);
+                    if (publisher)
+                        published = publisher->publish(arch::experimental::TestMessage<TimestampedMessage>(msg_data));
                     if (!published)
                     {
                         std::this_thread::yield();
@@ -564,7 +629,7 @@ namespace arch::experimental
             {
                 executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено
 
-                size_t current_queue_size = slot->queue_size();
+                size_t current_queue_size = slot ? slot->queue_size() : 0;
                 size_t current_received   = received.load();
 
                 // Проверяем прогресс
@@ -589,15 +654,15 @@ namespace arch::experimental
             }
 
             // Уменьшенная финальная обработка
-            for (int i = 0; i < 50 && (received < iterations || slot->queue_size() > 0); ++i)    // Уменьшено
+            for (int i = 0; i < 50 && (received < iterations || (slot && slot->queue_size() > 0)); ++i)    // Уменьшено
             {
                 executor->spin_once(std::chrono::milliseconds(5));
-                if (slot->queue_size() == 0 && received >= iterations)
+                if (slot && slot->queue_size() == 0 && received >= iterations)
                     break;
             }
 
             auto end_time = std::chrono::high_resolution_clock::now();
-            topic->destroy();
+            factory->destroy();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
@@ -637,24 +702,36 @@ namespace arch::experimental
 
             size_t base_memory = get_current_memory_usage();
 
-            const size_t topic_count           = 50;
-            const size_t subscribers_per_topic = 5;
+            const size_t topic_count           = 20;    // Уменьшено с 50
+            const size_t subscribers_per_topic = 3;     // Уменьшено с 5
 
             auto executor = std::make_shared<Executor>(2);
             executor->start();
 
-            std::vector<std::shared_ptr<Topic<int>>> topics;
-            std::vector<std::shared_ptr<SubscriberSlot<int>>> slots;
+            auto factory = std::make_shared<Factory>("benchmark_memory_factory");
+
+            std::vector<std::shared_ptr<Subscription<arch::experimental::TestMessage<int>>>> subscriptions;
+            std::vector<std::shared_ptr<Publisher<arch::experimental::TestMessage<int>>>> publishers;
             std::atomic<size_t> received_count{0};
             std::atomic<size_t> dropped_count{0};
 
             for (size_t i = 0; i < topic_count; ++i)
             {
-                auto topic = std::make_shared<Topic<int>>(
-                    "/benchmark/memory/topic_" + std::to_string(i), QoS::Reliable(10));
+                std::string topic_name = "/benchmark/memory/topic_" + std::to_string(i);
 
-                topics.push_back(topic);
-                executor->add_topic(topic);
+                // Create publisher through Factory (ROS2-like API) - using TestMessage for benchmarking
+                auto publisher = factory->createPublisher<arch::experimental::TestMessage<int>>(topic_name, QoS::Reliable(10));
+                if (publisher)
+                {
+                    publishers.push_back(publisher);
+                }
+
+                // Get topic from Factory and add to executor
+                auto topic = factory->getTopic<arch::experimental::TestMessage<int>>(topic_name);
+                if (topic)
+                {
+                    executor->add_topic(topic);
+                }
 
                 for (size_t j = 0; j < subscribers_per_topic; ++j)
                 {
@@ -662,19 +739,30 @@ namespace arch::experimental
                         CallbackGroup::Type::Reentrant,
                         "mem_test_" + std::to_string(i) + "_" + std::to_string(j));
 
-                    auto slot = topic->subscribe(
-                        [&received_count](auto msg) {
-                            if (msg)
+                    // Create subscription through Factory (ROS2-like API) - using TestMessage for benchmarking
+                    auto subscription_void = factory->createSubscription<arch::experimental::TestMessage<int>>(
+                        topic_name,
+                        [&received_count](message_ptr<const IMessage> msg) {
+                            // Получаем конкретный тип сообщения из IMessagePtr
+                            auto int_msg = std::dynamic_pointer_cast<const arch::experimental::TestMessage<int>>(msg);
+                            if (int_msg)
                             {
                                 received_count++;
                                 // Minimal processing
-                                volatile int dummy = msg->data;
+                                volatile int dummy = int_msg->data;
                                 (void)dummy;
                             }
                         },
-                        callback_group,
-                        QoS::Reliable(10));
-                    slots.push_back(slot);
+                        QoS::Reliable(10),
+                        callback_group);
+                    
+                    // Cast to Subscription<TestMessage<int>> for compatibility
+                    auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<int>>>(subscription_void);
+
+                    if (subscription)
+                    {
+                        subscriptions.push_back(subscription);
+                    }
                 }
             }
 
@@ -683,14 +771,17 @@ namespace arch::experimental
 
             auto start_time = std::chrono::high_resolution_clock::now();
 
-            for (auto& topic : topics)
+            // Publish messages using publishers from Factory
+            for (auto& publisher : publishers)
             {
-                Publisher<int> publisher(topic);
-                for (size_t i = 0; i < messages_per_topic; ++i)
+                if (publisher)
                 {
-                    if (!publisher.publish(static_cast<int>(i)))
-                        dropped_count++;
-                    total_messages++;
+                    for (size_t i = 0; i < messages_per_topic; ++i)
+                    {
+                        if (!publisher->publish(arch::experimental::TestMessage<int>(static_cast<int>(i))))
+                            dropped_count++;
+                        total_messages++;
+                    }
                 }
             }
 
@@ -704,12 +795,16 @@ namespace arch::experimental
                 executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено
 
                 bool has_messages = false;
-                for (const auto& slot : slots)
+                for (const auto& subscription : subscriptions)
                 {
-                    if (slot->queue_size() > 0)
+                    if (subscription)
                     {
-                        has_messages = true;
-                        break;
+                        auto slot = subscription->getSlot();
+                        if (slot && slot->queue_size() > 0)
+                        {
+                            has_messages = true;
+                            break;
+                        }
                     }
                 }
 
@@ -729,11 +824,8 @@ namespace arch::experimental
 
             size_t current_memory = get_current_memory_usage();
 
-            // Cleanup
-            for (auto& topic : topics)
-            {
-                topic->destroy();
-            }
+            // Cleanup - destroy factory (will destroy all subscriptions/publishers)
+            factory->destroy();
 
             std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
@@ -753,7 +845,7 @@ namespace arch::experimental
             else
                 result.throughput_msg_per_sec = 0;
 
-            //std::cerr << " Done (" << topics.size() << " topics, " << slots.size() << " subscribers)\n";
+            //std::cerr << " Done (" << topic_count << " topics, " << subscriptions.size() << " subscribers)\n";
 
             return result;
         }
@@ -1033,4 +1125,4 @@ namespace arch::experimental
 
 }    // namespace arch::experimental
 
-#endif    // ARCH_BENCHMARK_H
+#endif    // !ARCH_BENCHMARK_H

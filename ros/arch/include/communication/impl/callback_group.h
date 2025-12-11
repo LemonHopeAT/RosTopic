@@ -1,7 +1,7 @@
 /**
- * @file CallbackGroup.h
+ * @file callback_group.h
  * @brief Callback group for thread synchronization of callbacks
- * @date 2024
+ * @date 2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -43,11 +43,7 @@ namespace arch::experimental
          * @param type Group type (MutuallyExclusive or Reentrant)
          * @param name Group name (optional)
          */
-        CallbackGroup(Type type, const std::string& name = "")
-        : type_(type), name_(name)
-        {
-            flag_.clear();
-        }
+        CallbackGroup(Type type, const std::string& name = "");
 
         /**
          * @brief Get group type
@@ -64,31 +60,12 @@ namespace arch::experimental
         /**
          * @brief Enter callback execution (acquire lock for MutuallyExclusive)
          */
-        void enter()
-        {
-            if (type_ == Type::MutuallyExclusive)
-            {
-                // Spin-lock без блокировок
-                while (flag_.test_and_set(std::memory_order_acquire))
-                {
-                    // Можно добавить std::this_thread::yield() для снижения нагрузки
-                    std::this_thread::yield();
-                }
-            }
-            // Reentrant: ничего не делаем
-        }
+        void enter();
 
         /**
          * @brief Leave callback execution (release lock for MutuallyExclusive)
          */
-        void leave()
-        {
-            if (type_ == Type::MutuallyExclusive)
-            {
-                flag_.clear(std::memory_order_release);
-            }
-            // Reentrant: ничего не делаем
-        }
+        void leave();
 
     private:
         Type type_;                              ///< Group type
@@ -98,4 +75,4 @@ namespace arch::experimental
 
 }    // namespace arch::experimental
 
-#endif    // ARCH_CCR_A_CALLBACK_GROUP_H
+#endif    // !ARCH_CCR_A_CALLBACK_GROUP_H

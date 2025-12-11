@@ -1,7 +1,7 @@
 /**
- * @file SubscriberSlot.h
+ * @file subscriber_slot.h
  * @brief Lock-free subscriber slot implementation with message queue and callback execution
- * @date 2024
+ * @date 2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -10,9 +10,9 @@
 #ifndef ARCH_COMM_SUBSCRIBER_SLOT_H
 #define ARCH_COMM_SUBSCRIBER_SLOT_H
 
-#include "CallbackGroup.h"
-#include "IMessage.h"
-#include "Qos.h"
+#include "callback_group.h"
+#include "qos.h"
+#include <arch/communication/imessage.h>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -27,139 +27,6 @@
 
 namespace arch::experimental
 {
-
-    /**
-     * @brief Lock-free SPSC (Single Producer Single Consumer) bounded queue
-     * @ingroup arch_experimental
-     * @tparam T Type of elements stored in queue (must be move-constructible and move-assignable)
-     *
-     * Optimized for the common ROS2 pattern: 1 publisher → 1 subscriber slot → 1 executor thread.
-     * Faster than MPMC because it doesn't need CAS operations - uses relaxed memory ordering.
-     */
-    template <typename T>
-    class LockFreeSPSCQueue
-    {
-        static_assert(std::is_move_constructible<T>::value && std::is_move_assignable<T>::value,
-                      "T must be move-constructible and move-assignable");
-
-        // Align Cell to cache line boundary to avoid false sharing
-        struct alignas(64) Cell
-        {
-            T data;
-        };
-
-    public:
-        /**
-         * @brief Constructs SPSC queue with given capacity
-         * @param capacity Queue capacity (will be rounded up to power of 2)
-         * @throw std::invalid_argument if capacity is 0
-         */
-        explicit LockFreeSPSCQueue(size_t capacity)
-        : capacity_(round_up_pow2(capacity)), mask_(capacity_ - 1), buffer_(capacity_)
-        {
-            if (capacity == 0)
-                throw std::invalid_argument("capacity must be > 0");
-            write_pos_.store(0, std::memory_order_relaxed);
-            read_pos_.store(0, std::memory_order_relaxed);
-        }
-
-        LockFreeSPSCQueue(const LockFreeSPSCQueue&) = delete;
-        LockFreeSPSCQueue& operator=(const LockFreeSPSCQueue&) = delete;
-
-        /**
-         * @brief Push item into queue (non-blocking)
-         * @param item Item to push (copied)
-         * @return true if pushed successfully, false if queue is full
-         * @note Can only be called from single producer thread
-         */
-        bool push(const T& item) { return push_impl(item); }
-        
-        /**
-         * @brief Push item into queue (non-blocking)
-         * @param item Item to push (moved)
-         * @return true if pushed successfully, false if queue is full
-         * @note Can only be called from single producer thread
-         */
-        bool push(T&& item) { return push_impl(std::move(item)); }
-
-        template <typename U>
-        bool push_impl(U&& item)
-        {
-            size_t current_write = write_pos_.load(std::memory_order_relaxed);
-            size_t next_write = (current_write + 1) & mask_;
-            
-            // Check if queue is full (read_pos would be at next_write)
-            size_t current_read = read_pos_.load(std::memory_order_acquire);
-            if (next_write == current_read)
-            {
-                return false; // queue full
-            }
-
-            // Write data
-            buffer_[current_write].data = std::forward<U>(item);
-            // Publish: make data visible to consumer
-            write_pos_.store(next_write, std::memory_order_release);
-            return true;
-        }
-
-        /**
-         * @brief Pop item from queue (non-blocking)
-         * @return Optional containing item if available, empty optional if queue is empty
-         * @note Can only be called from single consumer thread
-         */
-        std::optional<T> pop()
-        {
-            size_t current_read = read_pos_.load(std::memory_order_relaxed);
-            size_t current_write = write_pos_.load(std::memory_order_acquire);
-            
-            if (current_read == current_write)
-            {
-                return std::nullopt; // queue empty
-            }
-
-            // Read data
-            T res = std::move(buffer_[current_read].data);
-            // Update read position
-            read_pos_.store((current_read + 1) & mask_, std::memory_order_release);
-            return std::optional<T>(std::move(res));
-        }
-
-        bool empty() const
-        {
-            size_t read = read_pos_.load(std::memory_order_acquire);
-            size_t write = write_pos_.load(std::memory_order_acquire);
-            return write == read;
-        }
-
-        size_t size() const
-        {
-            size_t read = read_pos_.load(std::memory_order_acquire);
-            size_t write = write_pos_.load(std::memory_order_acquire);
-            if (write >= read)
-                return write - read;
-            return capacity_ - read + write;
-        }
-
-        size_t capacity() const noexcept { return capacity_; }
-
-    private:
-        static size_t round_up_pow2(size_t x)
-        {
-            if (x == 0)
-                return 1;
-            --x;
-            for (size_t i = 1; i < sizeof(size_t) * 8; i <<= 1)
-                x |= x >> i;
-            return ++x;
-        }
-
-        const size_t capacity_;
-        const size_t mask_;
-        std::vector<Cell> buffer_;
-        // Producer and consumer on separate cache lines
-        alignas(64) std::atomic_size_t write_pos_{0};  // producer writes here
-        alignas(64) std::atomic_size_t read_pos_{0};   // consumer reads here
-    };
 
     /**
      * @brief Lock-free MPMC (Multiple Producer Multiple Consumer) bounded queue
@@ -200,7 +67,6 @@ namespace arch::experimental
             enqueue_pos_.store(0, std::memory_order_relaxed);
             dequeue_pos_.store(0, std::memory_order_relaxed);
         }
-        
 
         LockFreeMPMCQueue(const LockFreeMPMCQueue&) = delete;
         LockFreeMPMCQueue& operator=(const LockFreeMPMCQueue&) = delete;
@@ -236,9 +102,9 @@ namespace arch::experimental
                 if (dif == 0)
                 {
                     // Use acquire-release for CAS to ensure proper synchronization
-                    if (enqueue_pos_.compare_exchange_weak(pos, pos + 1, 
-                        std::memory_order_acq_rel, 
-                        std::memory_order_acquire))
+                    if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
+                                                           std::memory_order_acq_rel,
+                                                           std::memory_order_acquire))
                     {
                         // For shared_ptr, assignment is thread-safe and efficient
                         cell.data = T(std::forward<Args>(args)...);
@@ -277,8 +143,8 @@ namespace arch::experimental
                 {
                     // Use acquire-release for CAS to ensure proper synchronization
                     if (dequeue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire))
+                                                           std::memory_order_acq_rel,
+                                                           std::memory_order_acquire))
                     {
                         // Move data out
                         T res = std::move(cell.data);
@@ -352,8 +218,7 @@ namespace arch::experimental
     class SubscriberSlot final
     {
     public:
-        using MessagePtrT = MessagePtr<MessageT>;
-        using Callback    = std::function<void(MessagePtrT)>;
+        using Callback = std::function<void(message_ptr<const IMessage>)>;
 
     private:
         /**
@@ -372,7 +237,7 @@ namespace arch::experimental
             SafeCallback(const SafeCallback&) = delete;
             SafeCallback& operator=(const SafeCallback&) = delete;
 
-            void execute(MessagePtrT msg)
+            void execute(message_ptr<const IMessage> msg)
             {
                 // Fast-path check
                 if (!valid_.load(std::memory_order_acquire))
@@ -479,23 +344,23 @@ namespace arch::experimental
          * @return true if pushed successfully, false otherwise
          * @note Fast path, lock-free. For Reliable QoS, retries a few times if queue is full.
          */
-        bool push_message(MessagePtrT msg)
+        bool push_message(message_ptr<const arch::IMessage> msg)
         {
             if (destroyed_.load(std::memory_order_acquire))
                 return false;
-            
+
             // For reliable QoS, retry a few times if queue is full
             if (qos_.reliability == QoS::Reliability::Reliable)
             {
-                int retries = 0;
+                int retries           = 0;
                 const int max_retries = 10;
                 while (retries < max_retries)
                 {
                     // Create a copy for this attempt (shared_ptr is cheap to copy)
-                    MessagePtrT msg_copy = msg;
+                    message_ptr<const IMessage> msg_copy = msg;
                     if (queue_.push(std::move(msg_copy)))
                         return true;
-                    
+
                     // Queue full, yield and retry
                     std::this_thread::yield();
                     retries++;
@@ -514,7 +379,7 @@ namespace arch::experimental
          * @brief Pop one message from queue (used by Executor)
          * @return Optional containing message if available, empty optional otherwise
          */
-        std::optional<MessagePtrT> pop_message()
+        std::optional<message_ptr<const arch::IMessage>> pop_message()
         {
             if (destroyed_.load(std::memory_order_acquire))
                 return std::nullopt;
@@ -525,7 +390,7 @@ namespace arch::experimental
          * @brief Execute callback with proper callback_group enter/leave
          * @param msg Message to pass to callback
          */
-        void execute_callback(MessagePtrT msg)
+        void execute_callback(message_ptr<const IMessage> msg)
         {
             if (destroyed_.load(std::memory_order_acquire))
                 return;
@@ -577,13 +442,13 @@ namespace arch::experimental
          * @return Reference to QoS settings
          */
         const QoS& qos() const { return qos_; }
-        
+
         /**
          * @brief Get consumer group identifier
          * @return Consumer group string
          */
         const std::string& consumer_group() const { return consumer_group_; }
-        
+
         /**
          * @brief Get callback group
          * @return Shared pointer to callback group (can be nullptr)
@@ -633,10 +498,10 @@ namespace arch::experimental
         // Use MPMC queue: supports multiple producers (multiple threads publishing to same topic)
         // and single consumer (executor thread). SPSC would be faster but doesn't support
         // the common case where multiple Publisher instances from different threads write to the same slot.
-        LockFreeMPMCQueue<MessagePtrT> queue_;
+        LockFreeMPMCQueue<message_ptr<const IMessage>> queue_;
         std::atomic<bool> destroyed_{false};
     };
 
 }    // namespace arch::experimental
 
-#endif    // ARCH_COMM_SUBSCRIBER_SLOT_H
+#endif    // !ARCH_COMM_SUBSCRIBER_SLOT_H

@@ -1,7 +1,7 @@
 /**
- * @file Topic.h
+ * @file topic.h
  * @brief Topic implementation with lock-free subscriber management
- * @date 2024
+ * @date 2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -9,8 +9,9 @@
 #ifndef ARCH_COMM_TOPIC_H
 #define ARCH_COMM_TOPIC_H
 
-#include "Qos.h"
-#include "SubscriberSlot.h"
+#include "qos.h"
+#include "subscriber_slot.h"
+#include <arch/communication/imessage.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -66,7 +67,7 @@ namespace arch::experimental
             if (t_node)
                 return t_node;
 
-            Node* n = new Node(kInactiveEpoch);
+            Node* n = new Node(K_INACTIVE_EPOCH);
 
             // push front: lock-free CAS on head_
             Node* old_head = head_.load(std::memory_order_acquire);
@@ -102,7 +103,7 @@ namespace arch::experimental
         {
             if (!n)
                 return;
-            n->epoch.store(kInactiveEpoch, std::memory_order_release);
+            n->epoch.store(K_INACTIVE_EPOCH, std::memory_order_release);
         }
 
         /**
@@ -204,7 +205,7 @@ namespace arch::experimental
 
         std::mutex retired_mutex_;
         std::vector<RetiredItem> retired_;
-        static constexpr uint64_t kInactiveEpoch = std::numeric_limits<uint64_t>::max();
+        static constexpr uint64_t K_INACTIVE_EPOCH = std::numeric_limits<uint64_t>::max();
     };
 
     /**
@@ -273,7 +274,7 @@ namespace arch::experimental
          * @note Creates slot (shared_ptr owner returned to caller), pushes raw pointer to internal vector (COW)
          */
         SubscriberSlotPtr subscribe(
-            std::function<void(MessagePtr<MessageT>)> callback,
+            std::function<void(message_ptr<const IMessage>)> callback,
             std::shared_ptr<CallbackGroup> group = nullptr,
             QoS qos                              = QoS(),
             const std::string& consumer_group    = "")
@@ -332,11 +333,11 @@ namespace arch::experimental
 
         /**
          * @brief Publish message to all subscribers
-         * @param msg Message to publish
+         * @param msg Message to publish (IMessagePtr)
          * @return true if published successfully, false otherwise
          * @note Single atomic load of slots pointer + iteration over raw pointers; minimal overhead
          */
-        bool publish(MessagePtr<MessageT> msg)
+        bool publish(message_ptr<const IMessage> msg)
         {
             if (!msg || destroyed_.load(std::memory_order_acquire))
                 return false;
@@ -434,4 +435,4 @@ namespace arch::experimental
 
 }    // namespace arch::experimental
 
-#endif    // ARCH_COMM_TOPIC_H
+#endif    // !ARCH_COMM_TOPIC_H

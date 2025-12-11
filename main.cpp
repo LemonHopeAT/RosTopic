@@ -1,12 +1,12 @@
 
+#include "arch/communication/imessage.h"
 #include "arch/utils.h"
-#include "include/CallbackGroup.h"
-#include "include/Executor.h"
-#include "include/IMessage.h"
-#include "include/Publisher.h"
-#include "include/Qos.h"
-#include "include/SubscriberSlot.h"
-#include "include/Topic.h"
+#include <communication/impl/callback_group.h>
+#include <communication/impl/executor.h>
+#include <communication/impl/publisher.h>
+#include <communication/impl/qos.h>
+#include <communication/impl/subscriber_slot.h>
+#include <communication/impl/topic.h>
 
 #include <future>
 #include <iostream>
@@ -355,19 +355,24 @@ private:
     std::shared_ptr<arch::SubscriberSlot<ChatMessage>> subscription_;
 
     // Обработчик входящих сообщений
-    void handleMessage(MessagePtr<ChatMessage> msg)
+    void handleMessage(message_ptr msg)
     {
         if (!msg)
             return;
 
+        // Получаем конкретный тип сообщения
+        auto chat_msg = std::dynamic_pointer_cast<const Message<ChatMessage>>(msg);
+        if (!chat_msg)
+            return;
+
         // Игнорируем собственные сообщения (чтобы не было эха)
-        if (msg->data.sender == name_)
+        if (chat_msg->data.sender == name_)
         {
             return;
         }
 
         std::cout << "\033[32m[" << name_ << " received]: "
-                  << msg->data.toString() << "\033[0m\n";
+                  << chat_msg->data.toString() << "\033[0m\n";
     }
 
 public:
@@ -679,8 +684,13 @@ void test_single_producer_single_consumer()
 
     // Создаем слот
     auto slot = std::make_shared<SubscriberSlot<TestMessage>>(
-        [](MessagePtr<TestMessage> msg) {
+        [](message_ptr msg) {
             if (!msg)
+                return;
+
+            // Получаем конкретный тип сообщения
+            auto test_msg = std::dynamic_pointer_cast<const Message<TestMessage>>(msg);
+            if (!test_msg)
                 return;
 
             // Имитация обработки
@@ -711,10 +721,11 @@ void test_single_producer_single_consumer()
 
         for (int i = 0; i < NUM_MESSAGES; ++i)
         {
-            auto msg            = std::make_shared<Message<TestMessage>>();
-            msg->data.id        = i;
-            msg->data.data      = "Message_" + std::to_string(i);
-            msg->data.timestamp = std::chrono::steady_clock::now();
+            TestMessage test_data;
+            test_data.id        = i;
+            test_data.data      = "Message_" + std::to_string(i);
+            test_data.timestamp = std::chrono::steady_clock::now();
+            auto msg            = makeMessage<TestMessage>(std::move(test_data));
 
             if (!slot->push_message(std::move(msg)))
             {
@@ -769,7 +780,7 @@ void test_multi_producer_single_consumer()
     QoS qos    = create_qos(true, 500);
 
     auto slot = std::make_shared<SubscriberSlot<TestMessage>>(
-        [](MessagePtr<TestMessage> msg) {
+        [](message_ptr msg) {
             if (!msg)
                 return;
             total_messages_processed.fetch_add(1, std::memory_order_relaxed);
@@ -791,9 +802,10 @@ void test_multi_producer_single_consumer()
         producers.emplace_back([&, p]() {
             for (int i = 0; i < MESSAGES_PER_PRODUCER; ++i)
             {
-                auto msg       = std::make_shared<Message<TestMessage>>();
-                msg->data.id   = p * 10000 + i;
-                msg->data.data = "Producer_" + std::to_string(p) + "_Msg_" + std::to_string(i);
+                TestMessage test_data;
+                test_data.id   = p * 10000 + i;
+                test_data.data = "Producer_" + std::to_string(p) + "_Msg_" + std::to_string(i);
+                auto msg       = makeMessage<TestMessage>(std::move(test_data));
 
                 if (!slot->push_message(std::move(msg)))
                 {
@@ -880,7 +892,7 @@ void test_destruction_during_operation()
     for (int i = 0; i < NUM_SLOTS; ++i)
     {
         auto slot = std::make_shared<SubscriberSlot<int>>(
-            [&messages_processed](MessagePtr<int> msg) {
+            [&messages_processed](message_ptr msg) {
                 if (msg)
                 {
                     messages_processed.fetch_add(1, std::memory_order_relaxed);
@@ -926,7 +938,7 @@ void test_destruction_during_operation()
         for (int i = 0; i < 5000; ++i)
         {
             int slot_idx = slot_dist(gen);
-            auto msg     = std::make_shared<Message<int>>(value_dist(gen));
+            auto msg     = makeMessage<int>(value_dist(gen));
 
             if (!slots[slot_idx]->push_message(std::move(msg)))
             {
@@ -968,7 +980,7 @@ void test_stress_high_throughput()
     auto start_time = std::chrono::steady_clock::now();
 
     auto slot = std::make_shared<SubscriberSlot<int>>(
-        [&processed](MessagePtr<int> msg) {
+        [&processed](message_ptr msg) {
             if (msg)
             {
                 processed.fetch_add(1, std::memory_order_relaxed);
@@ -999,7 +1011,7 @@ void test_stress_high_throughput()
 
             while (!stop_flag.load(std::memory_order_acquire))
             {
-                auto msg = std::make_shared<Message<int>>(message_id++);
+                auto msg = makeMessage<int>(message_id++);
 
                 // Не проверяем результат - это best effort
                 slot->push_message(std::move(msg));
@@ -1073,11 +1085,16 @@ void test_memory_ordering()
     QoS qos    = create_qos(true, 1000);
 
     auto slot = std::make_shared<SubscriberSlot<int>>(
-        [&](MessagePtr<int> msg) {
+        [&](message_ptr msg) {
             if (!msg)
                 return;
 
-            int current_id = msg->data;
+            // Получаем конкретный тип сообщения
+            auto int_msg = std::dynamic_pointer_cast<const Message<int>>(msg);
+            if (!int_msg)
+                return;
+
+            int current_id = int_msg->data;
             int previous   = last_seen_id.exchange(current_id);
 
             // Проверяем, что сообщения приходят в порядке возрастания
@@ -1096,7 +1113,7 @@ void test_memory_ordering()
     std::thread producer([&]() {
         for (int i = 0; i < NUM_MESSAGES; ++i)
         {
-            auto msg = std::make_shared<Message<int>>(i);
+            auto msg = makeMessage<int>(i);
             slot->push_message(std::move(msg));
         }
         stop_flag.store(true, std::memory_order_release);
@@ -1137,7 +1154,7 @@ void test_consumer_groups()
 
     // Создаем два слота с разными consumer groups
     auto slot1 = std::make_shared<SubscriberSlot<int>>(
-        [&group1_processed](MessagePtr<int> msg) {
+        [&group1_processed](message_ptr msg) {
             if (msg)
             {
                 group1_processed.fetch_add(1, std::memory_order_relaxed);
@@ -1148,7 +1165,7 @@ void test_consumer_groups()
         "group1");
 
     auto slot2 = std::make_shared<SubscriberSlot<int>>(
-        [&group2_processed](MessagePtr<int> msg) {
+        [&group2_processed](message_ptr msg) {
             if (msg)
             {
                 group2_processed.fetch_add(1, std::memory_order_relaxed);
@@ -1165,8 +1182,8 @@ void test_consumer_groups()
     std::thread producer([&]() {
         for (int i = 0; i < NUM_MESSAGES; ++i)
         {
-            auto msg1 = std::make_shared<Message<int>>(i);
-            auto msg2 = std::make_shared<Message<int>>(i * 2);
+            auto msg1 = makeMessage<int>(i);
+            auto msg2 = makeMessage<int>(i * 2);
 
             slot1->push_message(std::move(msg1));
             slot2->push_message(std::move(msg2));
@@ -1273,7 +1290,7 @@ int main()
 #endif
 
 #ifdef TEST_BECH
-#include "include/Benchmark.h"
+#include <experimental/benchmark.h>
 int main()
 {
     try
@@ -1311,20 +1328,20 @@ int main()
 
         // Запускаем бенчмарки в цикле с усреднением
         // Каждый тест запускается несколько раз и усредняется
-        const size_t iterations_per_test = 3;  // Количество итераций для усреднения каждого теста
-        const size_t total_cycles = 100000;    // Общее количество циклов
+        const size_t iterations_per_test = 3;         // Количество итераций для усреднения каждого теста
+        const size_t total_cycles        = 100000;    // Общее количество циклов
 
         for (size_t i = 0; i < total_cycles; ++i)
         {
             std::cout << "\n========================================\n";
             std::cout << "Cycle #: " << i << " / " << total_cycles << "\n";
             std::cout << "========================================\n";
-            
+
             // run_all_benchmarks теперь принимает параметр iterations_per_test
             // и усредняет результаты внутри
             auto results = Benchmark::run_all_benchmarks(iterations_per_test);
             all_results.insert(all_results.end(), results.begin(), results.end());
-            
+
             // Сохраняем промежуточные результаты каждые 10 циклов
             if ((i + 1) % 10 == 0)
             {

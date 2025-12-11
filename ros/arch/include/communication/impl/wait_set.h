@@ -1,7 +1,7 @@
 /**
- * @file WaitSet.h
+ * @file wait_set.h
  * @brief Lock-free wait set for thread synchronization
- * @date 2024
+ * @date 2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -34,57 +34,17 @@ namespace arch::experimental
         /**
          * @brief Notify one waiting thread
          */
-        void notify() noexcept
-        {
-            // Увеличиваем последовательность с полным барьером
-            seq_.fetch_add(1, std::memory_order_acq_rel);
-            // Используем fence для гарантии видимости изменений
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-        }
+        void notify() noexcept;
 
         /**
          * @brief Notify all waiting threads
          */
-        void notify_all() noexcept
-        {
-            // Для notify_all в lock-free реализации делаем то же самое
-            seq_.fetch_add(1, std::memory_order_acq_rel);
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-        }
+        void notify_all() noexcept;
 
         /**
          * @brief Wait for notification (blocking)
          */
-        void wait()
-        {
-            uint64_t cur = seq_.load(std::memory_order_acquire);
-
-            // Busy-wait с exponential backoff
-            int spin_count     = 0;
-            const int max_spin = 1000;
-
-            while (seq_.load(std::memory_order_acquire) == cur)
-            {
-                if (spin_count < max_spin)
-                {
-                    // Пробуем спин-лок
-                    ++spin_count;
-// Пауза для процессора (помогает в гипертрединге)
-#ifdef __x86_64__
-                    asm volatile("pause" ::
-                                     : "memory");
-#elif defined(__aarch64__)
-                    asm volatile("yield" ::
-                                     : "memory");
-#endif
-                }
-                else
-                {
-                    // После многих попыток - уступаем процессор
-                    std::this_thread::yield();
-                }
-            }
-        }
+        void wait();
 
         /**
          * @brief Wait for notification with timeout
@@ -108,7 +68,7 @@ namespace arch::experimental
                 auto now = std::chrono::steady_clock::now();
                 if (now >= deadline)
                 {
-                    return false;    // Таймаут
+                    return false;
                 }
 
                 if (spin_count < max_spin)
@@ -124,11 +84,9 @@ namespace arch::experimental
                 }
                 else
                 {
-                    // Рассчитываем оставшееся время для sleep
                     auto remaining = deadline - now;
                     if (remaining > std::chrono::milliseconds(1))
                     {
-                        // Спим небольшими интервалами
                         std::this_thread::sleep_for(std::chrono::microseconds(100));
                     }
                     else
@@ -145,19 +103,9 @@ namespace arch::experimental
          * @brief Try to wait without blocking
          * @return true if notification occurred, false otherwise
          */
-        bool try_wait() noexcept
-        {
-            static thread_local uint64_t last_seen = 0;
-            uint64_t current                       = seq_.load(std::memory_order_acquire);
-            if (current != last_seen)
-            {
-                last_seen = current;
-                return true;
-            }
-            return false;
-        }
+        bool try_wait() noexcept;
     };
 
 }    // namespace arch::experimental
 
-#endif    // ARCH_COMM_WAITSET_H
+#endif    // !ARCH_COMM_WAITSET_H

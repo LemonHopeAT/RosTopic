@@ -1,0 +1,186 @@
+/**
+ * @file subscription.h
+ * @brief Subscription class for subscribing to topics (ROS2-like API)
+ * @date 2025
+ * @version 1.0.0
+ * @ingroup arch_experimental
+ */
+
+#ifndef ARCH_COMM_SUBSCRIPTION_H
+#define ARCH_COMM_SUBSCRIPTION_H
+
+#include "callback_group.h"
+#include <arch/communication/imessage.h>
+#include "qos.h"
+#include "subscriber_slot.h"
+#include "topic.h"
+#include "../waitable.h"
+#include <functional>
+#include <memory>
+#include <string>
+
+namespace arch::experimental
+{
+
+    /**
+     * @brief Subscription to a topic (ROS2-like API)
+     * @ingroup arch_experimental
+     * @tparam MessageT Type of message data
+     *
+     * Represents a subscription to a topic. Similar to rclcpp::Subscription in ROS2.
+     * Manages the lifecycle of SubscriberSlot and provides ROS2-like interface.
+     */
+    template <typename MessageT>
+    class Subscription : public Waitable
+    {
+    public:
+        using Callback = std::function<void(message_ptr<const IMessage>)>;
+
+        /**
+         * @brief Constructs subscription
+         * @param topic Shared pointer to topic
+         * @param callback Callback function to execute when message is received
+         * @param group Callback group for thread synchronization (can be nullptr)
+         * @param qos Quality of Service settings
+         * @param consumer_group Consumer group identifier (for SingleConsumer delivery)
+         */
+        Subscription(std::shared_ptr<Topic<MessageT>> topic,
+                     Callback callback,
+                     std::shared_ptr<CallbackGroup> group = nullptr,
+                     QoS qos                              = QoS(),
+                     const std::string& consumer_group    = "")
+        : topic_(std::move(topic)), slot_(nullptr), destroyed_(false)
+        {
+            if (topic_)
+            {
+                slot_ = topic_->subscribe(std::move(callback), std::move(group), qos, consumer_group);
+            }
+        }
+
+        Subscription(const Subscription&) = delete;
+        Subscription& operator=(const Subscription&) = delete;
+
+        Subscription(Subscription&& other) noexcept
+        : topic_(std::move(other.topic_)), slot_(std::move(other.slot_)), destroyed_(other.destroyed_.load())
+        {
+            other.destroyed_.store(true);
+        }
+
+        Subscription& operator=(Subscription&& other) noexcept
+        {
+            if (this != &other)
+            {
+                destroy();
+                topic_     = std::move(other.topic_);
+                slot_      = std::move(other.slot_);
+                destroyed_ = other.destroyed_.load();
+                other.destroyed_.store(true);
+            }
+            return *this;
+        }
+
+        ~Subscription() override { destroy(); }
+
+        /**
+         * @brief Get topic name
+         * @return Topic name string
+         */
+        std::string getTopicName() const
+        {
+            return topic_ ? topic_->name() : std::string();
+        }
+
+        /**
+         * @brief Get QoS settings
+         * @return Reference to QoS settings
+         */
+        const QoS& getQoS() const
+        {
+            static const QoS empty_qos;
+            return slot_ ? slot_->qos() : empty_qos;
+        }
+
+        /**
+         * @brief Get queue size
+         * @return Number of messages in queue
+         */
+        size_t getQueueSize() const
+        {
+            return slot_ ? slot_->queue_size() : 0;
+        }
+
+        /**
+         * @brief Get queue capacity
+         * @return Maximum number of messages queue can hold
+         */
+        size_t getQueueCapacity() const
+        {
+            return slot_ ? slot_->queue_capacity() : 0;
+        }
+
+        /**
+         * @brief Destroy subscription
+         */
+        void destroy()
+        {
+            bool expected = false;
+            if (!destroyed_.compare_exchange_strong(expected, true))
+                return;
+
+            if (slot_ && topic_)
+            {
+                topic_->unsubscribe(slot_);
+                slot_.reset();
+            }
+        }
+
+        /**
+         * @brief Check if subscription is valid
+         */
+        bool isValid() const override
+        {
+            return !destroyed_.load() && slot_ != nullptr && topic_ != nullptr;
+        }
+
+        // Waitable interface
+        bool isReady() const override
+        {
+            return isValid() && slot_ && slot_->has_messages();
+        }
+
+        void execute() override
+        {
+            if (!isValid() || !slot_)
+                return;
+
+            // Executor will call slot->execute_callback() directly
+            // This method is here for Waitable interface compliance
+        }
+
+        void addToWaitSet(WaitSet& wait_set) override
+        {
+            // WaitSet integration can be added here if needed
+            (void)wait_set;
+        }
+
+        void removeFromWaitSet(WaitSet& wait_set) override
+        {
+            // WaitSet integration can be added here if needed
+            (void)wait_set;
+        }
+
+        /**
+         * @brief Get underlying subscriber slot (for Executor use)
+         * @return Shared pointer to subscriber slot (can be nullptr)
+         */
+        std::shared_ptr<SubscriberSlot<MessageT>> getSlot() const { return slot_; }
+
+    private:
+        std::shared_ptr<Topic<MessageT>> topic_;
+        std::shared_ptr<SubscriberSlot<MessageT>> slot_;
+        std::atomic<bool> destroyed_{false};
+    };
+
+}    // namespace arch::experimental
+
+#endif    // !ARCH_COMM_SUBSCRIPTION_H
