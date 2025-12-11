@@ -87,7 +87,17 @@ namespace arch::experimental
          */
         std::string getTopicName() const
         {
-            return topic_ ? topic_->name() : std::string();
+            return topic_ ? topic_->get_topic_name() : std::string();
+        }
+        
+        /**
+         * @brief Get topic name (ROS2-like API)
+         * @return Topic name string
+         */
+        const std::string& get_topic_name() const
+        {
+            static const std::string empty;
+            return topic_ ? topic_->get_topic_name() : empty;
         }
 
         /**
@@ -116,6 +126,33 @@ namespace arch::experimental
         size_t getQueueCapacity() const
         {
             return slot_ ? slot_->queue_capacity() : 0;
+        }
+        
+        /**
+         * @brief Get number of publishers for this topic
+         * @return Number of active publishers
+         */
+        size_t get_publisher_count() const
+        {
+            return topic_ ? topic_->get_publisher_count() : 0;
+        }
+        
+        /**
+         * @brief Get number of subscriptions to this topic
+         * @return Number of active subscriptions
+         */
+        size_t get_subscription_count() const
+        {
+            return topic_ ? topic_->get_subscription_count() : 0;
+        }
+        
+        /**
+         * @brief Get underlying topic
+         * @return Shared pointer to topic (can be nullptr)
+         */
+        std::shared_ptr<Topic<MessageT>> get_topic() const
+        {
+            return topic_;
         }
 
         /**
@@ -174,6 +211,15 @@ namespace arch::experimental
          * @return Shared pointer to subscriber slot (can be nullptr)
          */
         std::shared_ptr<SubscriberSlot<MessageT>> getSlot() const { return slot_; }
+        
+        /**
+         * @brief Get QoS settings for this subscription
+         * @return Reference to QoS settings
+         */
+        const QoS& get_qos() const
+        {
+            return getQoS();
+        }
 
     private:
         std::shared_ptr<Topic<MessageT>> topic_;

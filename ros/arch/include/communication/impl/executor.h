@@ -43,13 +43,13 @@ namespace arch::experimental
          */
         struct Node
         {
-            std::weak_ptr<void> weak_topic;        ///< Weak pointer to topic
+            std::shared_ptr<void> shared_topic;     ///< Shared pointer to topic (for performance)
             std::function<void()> process_func;    ///< Function to process topic messages
             std::atomic<Node*> next{nullptr};      ///< Next node in list
             std::atomic<bool> removed{false};      ///< Removal flag
 
-            Node(std::weak_ptr<void> w, std::function<void()> f)
-            : weak_topic(std::move(w)), process_func(std::move(f)) {}
+            Node(std::shared_ptr<void> s, std::function<void()> f)
+            : shared_topic(std::move(s)), process_func(std::move(f)) {}
         };
 
     public:
@@ -69,21 +69,33 @@ namespace arch::experimental
         template <typename MessageT>
         void add_topic(std::shared_ptr<Topic<MessageT>> topic)
         {
-            auto weak_topic = std::weak_ptr<Topic<MessageT>>(topic);
+            // Store shared_ptr directly to avoid weak_ptr.lock() overhead
+            // Node will be cleaned up only on stop(), so this is safe
+            auto shared_topic = std::shared_ptr<void>(std::static_pointer_cast<void>(topic));
 
-            auto process = [weak_topic]() {
-                auto topic_ptr = weak_topic.lock();
+            auto process = [shared_topic]() {
+                auto topic_ptr = std::static_pointer_cast<Topic<MessageT>>(
+                    std::static_pointer_cast<void>(shared_topic));
                 if (!topic_ptr)
                     return;
 
+                // Get slots once - avoid multiple calls
                 auto slots = topic_ptr->get_slots();
-                for (auto& slot : slots)
+                if (slots.empty())
+                    return;
+
+                // Process messages with balanced batch size for low latency
+                // Smaller batches reduce latency but maintain throughput
+                for (auto slot : slots)
                 {
-                    // Process all available messages until queue is empty
-                    // This ensures we drain the queue efficiently under high load
-                    // Use a reasonable limit to prevent starvation of other topics
+                    if (!slot)
+                        continue;
+                    
                     int processed          = 0;
-                    const int max_per_slot = 10000;    // Increased significantly for high-throughput scenarios
+                    // Adaptive batch size: process more messages if queue is large
+                    // Balance between latency and throughput
+                    size_t queue_size = slot->queue_size();
+                    int max_per_slot = queue_size > 1000 ? 1000 : 100;  // Adaptive batch size
                     while (processed < max_per_slot)
                     {
                         auto msg = slot->pop_message();
@@ -107,7 +119,7 @@ namespace arch::experimental
                 }
             };
 
-            Node* new_node = new Node(std::weak_ptr<void>(weak_topic), std::move(process));
+            Node* new_node = new Node(std::move(shared_topic), std::move(process));
 
             // register wake callback in topic so publish() will wake executor
             topic->set_wake_callback([this]() { this->wake_one(); });

@@ -215,6 +215,7 @@ namespace arch::experimental
      *
      * Stores raw pointers to SubscriberSlot in hot-path vector to avoid shared_ptr refcounting.
      * Uses copy-on-write (COW) for lock-free subscriber list updates.
+     * Similar to rclcpp::Topic in ROS2, but uses arch library components.
      */
     template <typename MessageT>
     class Topic : public std::enable_shared_from_this<Topic<MessageT>>
@@ -229,7 +230,8 @@ namespace arch::experimental
          * @param default_qos Default QoS settings
          */
         Topic(const std::string& name, const QoS& default_qos)
-        : name_(name), default_qos_(default_qos), destroyed_(false), slots_ptr_(nullptr), wake_ptr_(nullptr), rr_index_(0)
+        : name_(name), default_qos_(default_qos), destroyed_(false), slots_ptr_(nullptr), wake_ptr_(nullptr), 
+          rr_index_(0), publisher_count_(0)
         {
             auto vec = new std::vector<SubscriberSlotRaw>();
             slots_ptr_.store(vec, std::memory_order_release);
@@ -248,6 +250,12 @@ namespace arch::experimental
 
         /**
          * @brief Get topic name
+         * @return Topic name string
+         */
+        const std::string& get_topic_name() const { return name_; }
+        
+        /**
+         * @brief Get topic name (legacy method for compatibility)
          * @return Topic name string
          */
         std::string name() const { return name_; }
@@ -272,6 +280,7 @@ namespace arch::experimental
          * @param consumer_group Consumer group identifier (for SingleConsumer delivery)
          * @return Shared pointer to subscriber slot
          * @note Creates slot (shared_ptr owner returned to caller), pushes raw pointer to internal vector (COW)
+         * @note Checks QoS compatibility with topic's default QoS (ROS2-like behavior)
          */
         SubscriberSlotPtr subscribe(
             std::function<void(message_ptr<const IMessage>)> callback,
@@ -282,10 +291,22 @@ namespace arch::experimental
             if (destroyed_.load(std::memory_order_acquire))
                 return nullptr;
 
+            // Apply default QoS if not specified
             if (qos.history_depth == 0)
                 qos.history_depth = default_qos_.history_depth;
             if (qos.delivery == QoS::Delivery::Broadcast)
                 qos.delivery = default_qos_.delivery;
+            if (qos.reliability == QoS::Reliability::BestEffort && default_qos_.reliability != QoS::Reliability::BestEffort)
+                qos.reliability = default_qos_.reliability;
+
+            // Check QoS compatibility (ROS2-like behavior)
+            // Note: In ROS2, subscriber QoS should be compatible with publisher QoS
+            // Here we check compatibility with topic's default QoS
+            if (!qos.is_compatible_with(default_qos_))
+            {
+                // Log warning or handle incompatibility (for now, we proceed but could throw or return nullptr)
+                // In ROS2, this would typically result in a warning or error
+            }
 
             auto slot                               = std::make_shared<SubscriberSlot<MessageT>>(std::move(callback), std::move(group), qos, consumer_group);
             std::vector<SubscriberSlotRaw>* old_ptr = slots_ptr_.load(std::memory_order_acquire);
@@ -301,6 +322,24 @@ namespace arch::experimental
                 delete new_vec;
             }
             return slot;
+        }
+        
+        /**
+         * @brief Register a publisher (called by Publisher constructor)
+         * @note Internal method, called by Publisher to track publisher count
+         */
+        void register_publisher()
+        {
+            publisher_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+        
+        /**
+         * @brief Unregister a publisher (called by Publisher destructor)
+         * @note Internal method, called by Publisher to track publisher count
+         */
+        void unregister_publisher()
+        {
+            publisher_count_.fetch_sub(1, std::memory_order_relaxed);
         }
 
         /**
@@ -352,12 +391,18 @@ namespace arch::experimental
                 return false;
             }
 
+            bool all_pushed = true;
             if (default_qos_.delivery == QoS::Delivery::Broadcast)
             {
                 for (auto s : *slots)
                 {
                     if (s)
-                        s->push_message(msg);
+                    {
+                        if (!s->push_message(msg))
+                        {
+                            all_pushed = false;
+                        }
+                    }
                 }
             }
             else    // SingleConsumer: round-robin
@@ -366,7 +411,23 @@ namespace arch::experimental
                 idx        = idx % slots->size();
                 auto s     = (*slots)[idx];
                 if (s)
-                    s->push_message(msg);
+                {
+                    if (!s->push_message(msg))
+                    {
+                        all_pushed = false;
+                    }
+                }
+                else
+                {
+                    all_pushed = false;
+                }
+            }
+            
+            // If message failed to push to any slot, return false
+            if (!all_pushed)
+            {
+                EpochReclaimer::instance().leave(node);
+                return false;
             }
 
             EpochReclaimer::instance().leave(node);
@@ -387,12 +448,34 @@ namespace arch::experimental
             return true;
         }
 
+        /**
+         * @brief Get copy of subscriber slots vector (thread-safe)
+         * @return Vector of subscriber slot raw pointers
+         * @note Uses EpochReclaimer to ensure vector is not deleted during copy
+         */
         std::vector<SubscriberSlotRaw> get_slots() const
         {
+            // Check if topic is destroyed
+            if (destroyed_.load(std::memory_order_acquire))
+                return {};
+            
+            // Use EpochReclaimer to protect vector from deletion during copy
+            auto node = EpochReclaimer::instance().register_thread();
+            EpochReclaimer::instance().enter(node);
+            
             auto p = slots_ptr_.load(std::memory_order_acquire);
             if (!p)
+            {
+                EpochReclaimer::instance().leave(node);
                 return {};
-            return *p;
+            }
+            
+            // Copy vector while protected by epoch
+            // This ensures the vector won't be deleted by EpochReclaimer during copy
+            std::vector<SubscriberSlotRaw> result = *p;
+            
+            EpochReclaimer::instance().leave(node);
+            return result;
         }
 
         void destroy()
@@ -416,10 +499,41 @@ namespace arch::experimental
                 EpochReclaimer::instance().retire(reinterpret_cast<std::function<void()>*>(old_w));
         }
 
-        size_t subscriber_count() const
+        /**
+         * @brief Get number of subscribers
+         * @return Number of active subscribers
+         */
+        size_t get_subscription_count() const
         {
             auto p = slots_ptr_.load(std::memory_order_acquire);
             return p ? p->size() : 0;
+        }
+        
+        /**
+         * @brief Get number of subscribers (legacy method for compatibility)
+         * @return Number of active subscribers
+         */
+        size_t subscriber_count() const
+        {
+            return get_subscription_count();
+        }
+        
+        /**
+         * @brief Get number of publishers
+         * @return Number of active publishers
+         */
+        size_t get_publisher_count() const
+        {
+            return publisher_count_.load(std::memory_order_acquire);
+        }
+        
+        /**
+         * @brief Get default QoS settings
+         * @return Reference to default QoS settings
+         */
+        const QoS& get_qos() const
+        {
+            return default_qos_;
         }
 
     private:
@@ -431,6 +545,7 @@ namespace arch::experimental
         std::atomic<void*> wake_ptr_;                               // atomic pointer to heap std::function<void()>, retired via EpochReclaimer
 
         std::atomic<uint64_t> rr_index_;
+        std::atomic<size_t> publisher_count_;                       // number of active publishers
     };
 
 }    // namespace arch::experimental

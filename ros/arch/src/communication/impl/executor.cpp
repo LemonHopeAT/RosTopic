@@ -44,11 +44,12 @@ namespace arch::experimental
                 {
                     try
                     {
-                        spin_once(100ms);
+                        // Reduced timeout for lower latency - spin more frequently
+                        spin_once(1ms);
                     }
                     catch (...)
                     {
-                        arch::sleep_for(10ms);
+                        arch::sleep_for(1ms);
                     }
                 }
             });
@@ -74,8 +75,8 @@ namespace arch::experimental
         {
             if (!cur->removed.load(std::memory_order_acquire))
             {
-                auto ptr = cur->weak_topic.lock();
-                if (!ptr || ptr.get() == topic.get())
+                // Direct comparison - no need for weak_ptr.lock()
+                if (cur->shared_topic.get() == topic.get())
                 {
                     cur->removed.store(true, std::memory_order_release);
                 }
@@ -89,6 +90,7 @@ namespace arch::experimental
         if (!running_.load(std::memory_order_acquire))
             return;
 
+        bool had_work = false;
         Node* cur = head_.load(std::memory_order_acquire);
         while (cur)
         {
@@ -98,7 +100,10 @@ namespace arch::experimental
                 try
                 {
                     if (cur->process_func)
+                    {
                         cur->process_func();
+                        had_work = true;
+                    }
                 }
                 catch (...)
                 {
@@ -107,7 +112,11 @@ namespace arch::experimental
             cur = cur->next.load(std::memory_order_acquire);
         }
 
-        waitset_.wait_for(timeout);
+        // Only wait if we didn't process any work - reduces latency
+        if (!had_work)
+        {
+            waitset_.wait_for(timeout);
+        }
         topics_processed_++;
     }
 

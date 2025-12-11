@@ -24,6 +24,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <type_traits>
+
+// Check C++20 support for atomic<shared_ptr>
+#if __cplusplus >= 202002L && defined(__cpp_lib_atomic_shared_ptr)
+#define ARCH_HAS_ATOMIC_SHARED_PTR 1
+#else
+#define ARCH_HAS_ATOMIC_SHARED_PTR 0
+#endif
 
 namespace arch::experimental
 {
@@ -34,8 +42,8 @@ namespace arch::experimental
      * @tparam T Type of elements stored in queue (must be move-constructible and move-assignable)
      *
      * Vyukov MPMC bounded queue implementation. Uses standard sequence-based algorithm with
-     * acquire/release ordering. Works well with T = MessagePtr<TMsg> (std::shared_ptr),
-     * because shared_ptr copy/assign is thread-safe.
+     * acquire/release ordering. For shared_ptr types, uses std::atomic<shared_ptr> (C++20)
+     * for safer memory operations in lock-free context.
      * Use this when you need multiple producers or multiple consumers.
      */
     template <typename T>
@@ -44,12 +52,46 @@ namespace arch::experimental
         static_assert(std::is_move_constructible<T>::value && std::is_move_assignable<T>::value,
                       "T must be move-constructible and move-assignable");
 
+        // Check if T is a shared_ptr type
+        template <typename U>
+        struct is_shared_ptr : std::false_type {};
+        
+        template <typename U>
+        struct is_shared_ptr<std::shared_ptr<U>> : std::true_type {};
+        
+        template <typename U>
+        struct is_shared_ptr<const std::shared_ptr<U>> : std::true_type {};
+
         // Align Cell to cache line boundary to avoid false sharing
         struct alignas(64) Cell
         {
             std::atomic<size_t> seq;
             T data;
         };
+        
+        // Specialized Cell for shared_ptr types using atomic<shared_ptr> (C++20)
+        // For C++17, we use regular shared_ptr with proper memory ordering via seq
+        template <typename U>
+        struct CellAtomic
+        {
+            std::atomic<size_t> seq;
+#if ARCH_HAS_ATOMIC_SHARED_PTR
+            std::atomic<U> data;  // C++20: atomic<shared_ptr> is supported
+#else
+            alignas(64) U data;  // C++17: use regular shared_ptr, seq provides synchronization
+#endif
+            
+            CellAtomic() : seq(0)
+#if ARCH_HAS_ATOMIC_SHARED_PTR
+                , data(nullptr)
+#endif
+            {}
+        };
+        
+        // Use specialized cell for shared_ptr types (both C++17 and C++20)
+        using CellType = typename std::conditional<is_shared_ptr<T>::value,
+                                                   CellAtomic<T>,
+                                                   Cell>::type;
 
     public:
         /**
@@ -63,7 +105,16 @@ namespace arch::experimental
             if (capacity == 0)
                 throw std::invalid_argument("capacity must be > 0");
             for (size_t i = 0; i < capacity_; ++i)
+            {
                 buffer_[i].seq.store(i, std::memory_order_relaxed);
+#if ARCH_HAS_ATOMIC_SHARED_PTR
+                if constexpr (is_shared_ptr<T>::value)
+                {
+                    // Initialize atomic<shared_ptr> to nullptr
+                    buffer_[i].data.store(T{}, std::memory_order_relaxed);
+                }
+#endif
+            }
             enqueue_pos_.store(0, std::memory_order_relaxed);
             dequeue_pos_.store(0, std::memory_order_relaxed);
         }
@@ -96,9 +147,9 @@ namespace arch::experimental
             size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
             for (;;)
             {
-                Cell& cell   = buffer_[pos & mask_];
-                size_t seq   = cell.seq.load(std::memory_order_acquire);
-                intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+                CellType& cell = buffer_[pos & mask_];
+                size_t seq     = cell.seq.load(std::memory_order_acquire);
+                intptr_t dif   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
                 if (dif == 0)
                 {
                     // Use acquire-release for CAS to ensure proper synchronization
@@ -106,10 +157,27 @@ namespace arch::experimental
                                                            std::memory_order_acq_rel,
                                                            std::memory_order_acquire))
                     {
-                        // For shared_ptr, assignment is thread-safe and efficient
-                        cell.data = T(std::forward<Args>(args)...);
+                        // For shared_ptr types, use atomic store (C++20) or regular assignment (C++17)
+                        if constexpr (is_shared_ptr<T>::value)
+                        {
+#if ARCH_HAS_ATOMIC_SHARED_PTR
+                            // C++20: Atomic store for shared_ptr - safer memory visibility
+                            cell.data.store(T(std::forward<Args>(args)...), std::memory_order_release);
+#else
+                            // C++17: Store data - seq.store(release) below provides release semantics
+                            // No need for explicit fence - seq.store(release) ensures visibility
+                            cell.data = T(std::forward<Args>(args)...);
+#endif
+                        }
+                        else
+                        {
+                            // For non-shared_ptr types, use regular assignment
+                            // seq.store(release) below ensures data visibility
+                            cell.data = T(std::forward<Args>(args)...);
+                        }
                         // publish: make data visible before seq update
                         // Use release to ensure all writes to data are visible
+                        // This release store synchronizes with acquire load in pop()
                         cell.seq.store(pos + 1, std::memory_order_release);
                         return true;
                     }
@@ -136,9 +204,9 @@ namespace arch::experimental
             size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
             for (;;)
             {
-                Cell& cell   = buffer_[pos & mask_];
-                size_t seq   = cell.seq.load(std::memory_order_acquire);
-                intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
+                CellType& cell = buffer_[pos & mask_];
+                size_t seq     = cell.seq.load(std::memory_order_acquire);
+                intptr_t dif   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
                 if (dif == 0)
                 {
                     // Use acquire-release for CAS to ensure proper synchronization
@@ -146,10 +214,32 @@ namespace arch::experimental
                                                            std::memory_order_acq_rel,
                                                            std::memory_order_acquire))
                     {
-                        // Move data out
-                        T res = std::move(cell.data);
+                        // For shared_ptr types, use atomic load (C++20) or regular move (C++17)
+                        T res;
+                        if constexpr (is_shared_ptr<T>::value)
+                        {
+#if ARCH_HAS_ATOMIC_SHARED_PTR
+                            // C++20: Atomic load for shared_ptr - safer memory visibility
+                            res = cell.data.load(std::memory_order_acquire);
+                            // Clear the atomic shared_ptr
+                            cell.data.store(T{}, std::memory_order_relaxed);
+#else
+                            // C++17: seq.load(acquire) above ensures we see producer's writes
+                            // seq == pos+1 means data is ready (set by producer with release)
+                            // Move data out - seq provides acquire semantics
+                            res = std::move(cell.data);
+                            // Clear data - seq.store(release) below ensures visibility
+                            cell.data = T{};
+#endif
+                        }
+                        else
+                        {
+                            // For non-shared_ptr types, use regular move
+                            res = std::move(cell.data);
+                        }
                         // mark slot as free for next round
                         // Use release to ensure all operations are visible
+                        // This release store synchronizes with acquire load in emplace()
                         cell.seq.store(pos + capacity_, std::memory_order_release);
                         return std::optional<T>(std::move(res));
                     }
@@ -200,7 +290,7 @@ namespace arch::experimental
 
         const size_t capacity_;
         const size_t mask_;
-        std::vector<Cell> buffer_;
+        std::vector<CellType> buffer_;
         alignas(64) std::atomic_size_t enqueue_pos_{0};
         alignas(64) std::atomic_size_t dequeue_pos_{0};
     };
@@ -349,11 +439,11 @@ namespace arch::experimental
             if (destroyed_.load(std::memory_order_acquire))
                 return false;
 
-            // For reliable QoS, retry a few times if queue is full
+            // For reliable QoS, retry more aggressively if queue is full
             if (qos_.reliability == QoS::Reliability::Reliable)
             {
                 int retries           = 0;
-                const int max_retries = 10;
+                const int max_retries = 100;  // Increased retries for reliable QoS
                 while (retries < max_retries)
                 {
                     // Create a copy for this attempt (shared_ptr is cheap to copy)
@@ -361,8 +451,19 @@ namespace arch::experimental
                     if (queue_.push(std::move(msg_copy)))
                         return true;
 
-                    // Queue full, yield and retry
-                    std::this_thread::yield();
+                    // Queue full, use exponential backoff
+                    if (retries < 10)
+                    {
+                        std::this_thread::yield();
+                    }
+                    else if (retries < 50)
+                    {
+                        std::this_thread::sleep_for(std::chrono::microseconds(10));
+                    }
+                    else
+                    {
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
                     retries++;
                 }
                 // After retries, try one final time with original msg
