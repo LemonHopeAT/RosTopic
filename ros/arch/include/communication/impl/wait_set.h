@@ -1,7 +1,7 @@
 /**
  * @file wait_set.h
  * @brief Lock-free wait set for thread synchronization
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */

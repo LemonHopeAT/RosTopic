@@ -1,7 +1,7 @@
 /**
  * @file wait_set.cpp
  * @brief Wait set implementation
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  */
 

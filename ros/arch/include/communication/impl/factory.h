@@ -1,7 +1,7 @@
 /**
  * @file factory.h
  * @brief Factory class for creating publishers and subscriptions (ROS2-like API)
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -13,12 +13,10 @@
 #include "publisher.h"
 #include "qos.h"
 #include "subscription.h"
-#include "topic.h"
+#include "topic_registry.h"
 #include <arch/communication/imessage.h>
 #include <memory>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 namespace arch::experimental
 {
@@ -52,29 +50,27 @@ namespace arch::experimental
 
         /**
          * @brief Create publisher for topic
-         * @tparam MessageT Type of message data
+         * @tparam Type Type of message data
          * @param topic_name Topic name
          * @param qos Quality of Service settings
          * @return Shared pointer to publisher
          */
-        template <typename MessageT>
-        std::shared_ptr<Publisher<MessageT>> createPublisher(const std::string& topic_name, const QoS& qos = QoS())
+        template <typename Type>
+        std::shared_ptr<Publisher<Type>> createPublisher(const std::string& topic_name, const QoS& qos = QoS())
         {
             if (destroyed_.load())
                 return nullptr;
 
-            auto topic = getOrCreateTopic<MessageT>(topic_name, qos);
+            auto topic = TopicRegistry::instance().getOrCreateTopic<Type>(topic_name, qos);
             if (!topic)
                 return nullptr;
 
-            auto publisher = std::make_shared<Publisher<MessageT>>(topic);
-            publishers_.push_back(std::static_pointer_cast<void>(publisher));
-            return publisher;
+            return std::make_shared<Publisher<Type>>(topic);
         }
 
         /**
          * @brief Create subscription to topic
-         * @tparam MessageT Type of message data
+         * @tparam Type Type of message data
          * @param topic_name Topic name
          * @param callback Callback function to execute when message is received
          * @param qos Quality of Service settings
@@ -82,8 +78,8 @@ namespace arch::experimental
          * @param consumer_group Consumer group identifier (for SingleConsumer delivery)
          * @return Shared pointer to subscription
          */
-        template <typename MessageT>
-        std::shared_ptr<Subscription<MessageT>> createSubscription(
+        template <typename Type>
+        std::shared_ptr<Subscription<Type>> createSubscription(
             const std::string& topic_name,
             std::function<void(message_ptr<const IMessage>)> callback,
             const QoS& qos                              = QoS(),
@@ -93,14 +89,12 @@ namespace arch::experimental
             if (destroyed_.load())
                 return nullptr;
 
-            auto topic = getOrCreateTopic<MessageT>(topic_name, qos);
+            auto topic = TopicRegistry::instance().getOrCreateTopic<Type>(topic_name, qos);
             if (!topic)
                 return nullptr;
 
-            auto subscription = std::make_shared<Subscription<MessageT>>(
+            return std::make_shared<Subscription<Type>>(
                 topic, std::move(callback), std::move(group), qos, consumer_group);
-            subscriptions_.push_back(std::static_pointer_cast<void>(subscription));
-            return subscription;
         }
 
         /**
@@ -124,57 +118,33 @@ namespace arch::experimental
                 return nullptr;
 
             // Use IMessage as the topic type for type-erased subscriptions working with IMessagePtr
-            auto topic = getOrCreateTopic<IMessage>(topic_name, qos);
+            auto topic = TopicRegistry::instance().getOrCreateTopic<IMessage>(topic_name, qos);
             if (!topic)
                 return nullptr;
 
             auto subscription = std::make_shared<Subscription<IMessage>>(
                 topic, std::move(callback), std::move(group), qos, consumer_group);
-            subscriptions_.push_back(std::static_pointer_cast<void>(subscription));
             return std::static_pointer_cast<void>(subscription);
         }
 
         /**
          * @brief Get topic by name
-         * @tparam MessageT Type of message data
+         * @tparam Type Type of message data
          * @param topic_name Topic name
          * @return Shared pointer to topic (nullptr if not found)
          */
-        template <typename MessageT>
-        std::shared_ptr<Topic<MessageT>> getTopic(const std::string& topic_name) const
+        template <typename Type>
+        std::shared_ptr<Topic<Type>> getTopic(const std::string& topic_name) const
         {
             if (destroyed_.load())
                 return nullptr;
 
-            std::string key = topic_name + "_" + typeid(MessageT).name();
-            auto it        = topics_.find(key);
-            if (it != topics_.end())
-            {
-                return std::static_pointer_cast<Topic<MessageT>>(it->second);
-            }
-            return nullptr;
+            return TopicRegistry::instance().getTopic<Type>(topic_name);
         }
 
         /**
-         * @brief Get all subscriptions
-         * @return Vector of subscription shared pointers (as void* for type erasure)
-         */
-        const std::vector<std::shared_ptr<void>>& getSubscriptions() const { return subscriptions_; }
-
-        /**
-         * @brief Get all publishers
-         * @return Vector of publisher shared pointers (as void* for type erasure)
-         */
-        const std::vector<std::shared_ptr<void>>& getPublishers() const { return publishers_; }
-
-        /**
-         * @brief Get all topics
-         * @return Map of topic names to topic shared pointers (as void* for type erasure)
-         */
-        const std::unordered_map<std::string, std::shared_ptr<void>>& getTopics() const { return topics_; }
-
-        /**
-         * @brief Destroy factory and all its entities
+         * @brief Destroy factory
+         * @note Factory no longer stores entities, so this only marks factory as destroyed
          */
         void destroy();
 
@@ -184,29 +154,8 @@ namespace arch::experimental
         bool isValid() const { return !destroyed_.load(); }
 
     private:
-        template <typename MessageT>
-        std::shared_ptr<Topic<MessageT>> getOrCreateTopic(const std::string& topic_name, const QoS& qos)
-        {
-            std::string key = topic_name + "_" + typeid(MessageT).name();
-            auto it        = topics_.find(key);
-            if (it != topics_.end())
-            {
-                return std::static_pointer_cast<Topic<MessageT>>(it->second);
-            }
-
-            // Create new topic
-            auto topic = std::make_shared<Topic<MessageT>>(topic_name, qos);
-            topics_[key] = std::static_pointer_cast<void>(topic);
-            return topic;
-        }
-
         std::string name_;
         std::atomic<bool> destroyed_{false};
-
-        // Type-erased storage for topics, subscriptions, and publishers
-        std::unordered_map<std::string, std::shared_ptr<void>> topics_;
-        std::vector<std::shared_ptr<void>> subscriptions_;
-        std::vector<std::shared_ptr<void>> publishers_;
     };
 
 }    // namespace arch::experimental

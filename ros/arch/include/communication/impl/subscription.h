@@ -1,7 +1,7 @@
 /**
  * @file subscription.h
  * @brief Subscription class for subscribing to topics (ROS2-like API)
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -9,12 +9,12 @@
 #ifndef ARCH_COMM_SUBSCRIPTION_H
 #define ARCH_COMM_SUBSCRIPTION_H
 
+#include "../waitable.h"
 #include "callback_group.h"
-#include <arch/communication/imessage.h>
 #include "qos.h"
 #include "subscriber_slot.h"
 #include "topic.h"
-#include "../waitable.h"
+#include <arch/communication/imessage.h>
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,12 +25,12 @@ namespace arch::experimental
     /**
      * @brief Subscription to a topic (ROS2-like API)
      * @ingroup arch_experimental
-     * @tparam MessageT Type of message data
+     * @tparam Type Type of message data
      *
      * Represents a subscription to a topic. Similar to rclcpp::Subscription in ROS2.
      * Manages the lifecycle of SubscriberSlot and provides ROS2-like interface.
      */
-    template <typename MessageT>
+    template <typename Type>
     class Subscription : public Waitable
     {
     public:
@@ -44,7 +44,7 @@ namespace arch::experimental
          * @param qos Quality of Service settings
          * @param consumer_group Consumer group identifier (for SingleConsumer delivery)
          */
-        Subscription(std::shared_ptr<Topic<MessageT>> topic,
+        Subscription(std::shared_ptr<Topic<Type>> topic,
                      Callback callback,
                      std::shared_ptr<CallbackGroup> group = nullptr,
                      QoS qos                              = QoS(),
@@ -85,19 +85,9 @@ namespace arch::experimental
          * @brief Get topic name
          * @return Topic name string
          */
-        std::string getTopicName() const
+        std::string get_topic_name() const
         {
             return topic_ ? topic_->get_topic_name() : std::string();
-        }
-        
-        /**
-         * @brief Get topic name (ROS2-like API)
-         * @return Topic name string
-         */
-        const std::string& get_topic_name() const
-        {
-            static const std::string empty;
-            return topic_ ? topic_->get_topic_name() : empty;
         }
 
         /**
@@ -127,7 +117,7 @@ namespace arch::experimental
         {
             return slot_ ? slot_->queue_capacity() : 0;
         }
-        
+
         /**
          * @brief Get number of publishers for this topic
          * @return Number of active publishers
@@ -136,7 +126,7 @@ namespace arch::experimental
         {
             return topic_ ? topic_->get_publisher_count() : 0;
         }
-        
+
         /**
          * @brief Get number of subscriptions to this topic
          * @return Number of active subscriptions
@@ -145,12 +135,12 @@ namespace arch::experimental
         {
             return topic_ ? topic_->get_subscription_count() : 0;
         }
-        
+
         /**
          * @brief Get underlying topic
          * @return Shared pointer to topic (can be nullptr)
          */
-        std::shared_ptr<Topic<MessageT>> get_topic() const
+        std::shared_ptr<Topic<Type>> get_topic() const
         {
             return topic_;
         }
@@ -210,8 +200,8 @@ namespace arch::experimental
          * @brief Get underlying subscriber slot (for Executor use)
          * @return Shared pointer to subscriber slot (can be nullptr)
          */
-        std::shared_ptr<SubscriberSlot<MessageT>> getSlot() const { return slot_; }
-        
+        std::shared_ptr<SubscriberSlot<Type>> getSlot() const { return slot_; }
+
         /**
          * @brief Get QoS settings for this subscription
          * @return Reference to QoS settings
@@ -222,8 +212,8 @@ namespace arch::experimental
         }
 
     private:
-        std::shared_ptr<Topic<MessageT>> topic_;
-        std::shared_ptr<SubscriberSlot<MessageT>> slot_;
+        std::shared_ptr<Topic<Type>> topic_;
+        std::shared_ptr<SubscriberSlot<Type>> slot_;
         std::atomic<bool> destroyed_{false};
     };
 

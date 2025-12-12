@@ -1,7 +1,7 @@
 /**
  * @file callback_group.h
  * @brief Callback group for thread synchronization of callbacks
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */

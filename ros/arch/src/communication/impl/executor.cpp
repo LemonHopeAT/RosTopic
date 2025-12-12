@@ -1,7 +1,7 @@
 /**
  * @file executor.cpp
  * @brief Lock-free executor implementation
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  */
 
@@ -70,7 +70,7 @@ namespace arch::experimental
 
     void Executor::remove_topic(std::shared_ptr<void> topic)
     {
-        Node* cur = head_.load(std::memory_order_acquire);
+        TopicNode* cur = head_.load(std::memory_order_acquire);
         while (cur)
         {
             if (!cur->removed.load(std::memory_order_acquire))
@@ -91,7 +91,7 @@ namespace arch::experimental
             return;
 
         bool had_work = false;
-        Node* cur = head_.load(std::memory_order_acquire);
+        TopicNode* cur = head_.load(std::memory_order_acquire);
         while (cur)
         {
             bool removed = cur->removed.load(std::memory_order_acquire);
@@ -113,7 +113,8 @@ namespace arch::experimental
         }
 
         // Only wait if we didn't process any work - reduces latency
-        if (!had_work)
+        // Use shorter timeout for faster response
+        if (!had_work && timeout.count() > 0)
         {
             waitset_.wait_for(timeout);
         }
@@ -122,8 +123,11 @@ namespace arch::experimental
 
     void Executor::spin_some()
     {
-        for (int i = 0; i < 100; ++i)
-            spin_once(std::chrono::milliseconds(1));
+        // Process multiple iterations without waiting for better throughput
+        for (int i = 0; i < 200; ++i)  // Increased iterations
+        {
+            spin_once(std::chrono::milliseconds(0));  // No wait - process immediately
+        }
     }
 
     void Executor::spin_all(int iterations)
@@ -150,10 +154,10 @@ namespace arch::experimental
 
     void Executor::cleanup_all_nodes()
     {
-        Node* cur = head_.exchange(nullptr, std::memory_order_acq_rel);
+        TopicNode* cur = head_.exchange(nullptr, std::memory_order_acq_rel);
         while (cur)
         {
-            Node* next = cur->next.load(std::memory_order_acquire);
+            TopicNode* next = cur->next.load(std::memory_order_acquire);
             delete cur;
             cur = next;
         }

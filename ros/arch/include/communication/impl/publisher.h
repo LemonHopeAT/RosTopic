@@ -1,7 +1,7 @@
 /**
  * @file publisher.h
  * @brief Publisher for publishing messages to topics
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -19,11 +19,11 @@ namespace arch::experimental
     /**
      * @brief Publisher for publishing messages to topics
      * @ingroup arch_experimental
-     * @tparam MessageT Type of message data
+     * @tparam Type Type of message data
      * 
      * Similar to rclcpp::Publisher in ROS2, but uses arch library components.
      */
-    template <typename MessageT>
+    template <typename Type>
     class Publisher
     {
     public:
@@ -31,14 +31,14 @@ namespace arch::experimental
          * @brief Constructs publisher for given topic
          * @param topic Shared pointer to topic
          */
-        Publisher(std::shared_ptr<Topic<MessageT>> topic) : topic_(std::move(topic))
+        Publisher(std::shared_ptr<Topic<Type>> topic) : topic_(std::move(topic))
         {
             if (topic_)
             {
                 topic_->register_publisher();
             }
         }
-        
+
         /**
          * @brief Destructor - unregisters publisher from topic
          */
@@ -49,7 +49,7 @@ namespace arch::experimental
                 topic_->unregister_publisher();
             }
         }
-        
+
         Publisher(const Publisher& other) : topic_(other.topic_)
         {
             if (topic_)
@@ -57,7 +57,7 @@ namespace arch::experimental
                 topic_->register_publisher();
             }
         }
-        
+
         Publisher& operator=(const Publisher& other)
         {
             if (this != &other)
@@ -74,12 +74,12 @@ namespace arch::experimental
             }
             return *this;
         }
-        
+
         Publisher(Publisher&& other) noexcept : topic_(std::move(other.topic_))
         {
             other.topic_.reset();
         }
-        
+
         Publisher& operator=(Publisher&& other) noexcept
         {
             if (this != &other)
@@ -103,7 +103,7 @@ namespace arch::experimental
         {
             return topic_ ? topic_->publish(std::move(msg)) : false;
         }
-        
+
         /**
          * @brief Publish message pointer (IMessagePtr) - legacy method
          * @param msg Message pointer to publish
@@ -119,27 +119,27 @@ namespace arch::experimental
          * @param data Message data to publish
          * @return true if published successfully, false otherwise
          */
-        bool publish(const MessageT& data)
+        bool publish(const Type& data)
         {
-            return publish(arch::makeSharedMsg<MessageT>(data));
+            return publish(arch::makeSharedMsg<Type>(data));
         }
-        
+
         /**
          * @brief Publish message data (moved) - ROS2-like API
          * @param data Message data to publish
          * @return true if published successfully, false otherwise
          */
-        bool publish(MessageT&& data)
+        bool publish(Type&& data)
         {
-            return publish(arch::makeSharedMsg<MessageT>(std::move(data)));
+            return publish(arch::makeSharedMsg<Type>(std::move(data)));
         }
-        
+
         /**
          * @brief Publish message data (copied) - legacy method
          * @param data Message data to publish
          * @return true if published successfully, false otherwise
          */
-        bool notify(const MessageT& data)
+        bool notify(const Type& data)
         {
             return publish(data);
         }
@@ -149,7 +149,7 @@ namespace arch::experimental
          * @param data Message data to publish
          * @return true if published successfully, false otherwise
          */
-        bool notify(MessageT&& data)
+        bool notify(Type&& data)
         {
             return publish(std::move(data));
         }
@@ -160,18 +160,9 @@ namespace arch::experimental
          */
         const std::string& get_topic_name() const
         {
-            return topic_ ? topic_->get_topic_name() : empty_;
+            return topic_ ? topic_->get_topic_name() : "";
         }
-        
-        /**
-         * @brief Get topic name (legacy method for compatibility)
-         * @return Topic name string (empty if topic is null)
-         */
-        const std::string& topic_name() const
-        {
-            return get_topic_name();
-        }
-        
+
         /**
          * @brief Get number of subscriptions to this topic
          * @return Number of active subscriptions
@@ -180,7 +171,7 @@ namespace arch::experimental
         {
             return topic_ ? topic_->get_subscription_count() : 0;
         }
-        
+
         /**
          * @brief Get number of publishers for this topic
          * @return Number of active publishers
@@ -189,7 +180,7 @@ namespace arch::experimental
         {
             return topic_ ? topic_->get_publisher_count() : 0;
         }
-        
+
         /**
          * @brief Check if publisher is valid
          * @return true if topic is valid, false otherwise
@@ -198,16 +189,16 @@ namespace arch::experimental
         {
             return topic_ != nullptr;
         }
-        
+
         /**
          * @brief Get underlying topic
          * @return Shared pointer to topic (can be nullptr)
          */
-        std::shared_ptr<Topic<MessageT>> get_topic() const
+        std::shared_ptr<Topic<Type>> get_topic() const
         {
             return topic_;
         }
-        
+
         /**
          * @brief Get QoS settings for this publisher
          * @return Reference to QoS settings
@@ -219,8 +210,7 @@ namespace arch::experimental
         }
 
     private:
-        std::shared_ptr<Topic<MessageT>> topic_;    ///< Topic to publish to
-        static inline std::string empty_;           ///< Empty string for null topic
+        std::shared_ptr<Topic<Type>> topic_;    ///< Topic to publish to
     };
 
 }    // namespace arch::experimental

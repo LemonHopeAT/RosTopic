@@ -1,7 +1,7 @@
 /**
  * @file topic.h
  * @brief Topic implementation with lock-free subscriber management
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -29,21 +29,21 @@ namespace arch::experimental
      * @brief Epoch-based memory reclaimer for lock-free data structures
      * @ingroup arch_experimental
      *
-     * Lock-free registration via singly-linked list of per-thread nodes.
-     * Each thread allocates one Node and pushes it to head_ on first register.
-     * Readers call enter(node)/leave(node) using their thread-local node pointer.
+     * Lock-free registration via singly-linked list of per-thread epoch nodes.
+     * Each thread allocates one EpochNode and pushes it to head_ on first register.
+     * Readers call enter(epoch_node)/leave(epoch_node) using their thread-local epoch node pointer.
      */
     class EpochReclaimer
     {
     public:
         /**
-         * @brief Per-thread epoch node
+         * @brief Per-thread epoch node for epoch-based reclamation
          */
-        struct Node
+        struct EpochNode
         {
             std::atomic<uint64_t> epoch;    ///< Current epoch for this thread
-            Node* next;                      ///< Next node in linked list
-            Node(uint64_t v) : epoch(v), next(nullptr) {}
+            EpochNode* next;                      ///< Next node in linked list
+            EpochNode(uint64_t v) : epoch(v), next(nullptr) {}
         };
 
         /**
@@ -57,20 +57,20 @@ namespace arch::experimental
         }
 
         /**
-         * @brief Register current thread and return thread-local node
-         * @return Pointer to thread-local node
+         * @brief Register current thread and return thread-local epoch node
+         * @return Pointer to thread-local epoch node
          * @note Creates and pushes to list on first call (lock-free push_front)
          */
-        Node* register_thread()
+        EpochNode* register_thread()
         {
-            static thread_local Node* t_node = nullptr;
+            static thread_local EpochNode* t_node = nullptr;
             if (t_node)
                 return t_node;
 
-            Node* n = new Node(K_INACTIVE_EPOCH);
+            EpochNode* n = new EpochNode(K_INACTIVE_EPOCH);
 
             // push front: lock-free CAS on head_
-            Node* old_head = head_.load(std::memory_order_acquire);
+            EpochNode* old_head = head_.load(std::memory_order_acquire);
             for (;;)
             {
                 n->next = old_head;
@@ -85,9 +85,9 @@ namespace arch::experimental
 
         /**
          * @brief Enter epoch (mark thread as active reader)
-         * @param n Thread-local node
+         * @param n Thread-local epoch node
          */
-        void enter(Node* n)
+        void enter(EpochNode* n)
         {
             if (!n)
                 return;
@@ -97,9 +97,9 @@ namespace arch::experimental
 
         /**
          * @brief Leave epoch (mark thread as inactive)
-         * @param n Thread-local node
+         * @param n Thread-local epoch node
          */
-        void leave(Node* n)
+        void leave(EpochNode* n)
         {
             if (!n)
                 return;
@@ -137,11 +137,11 @@ namespace arch::experimental
                 if (it.deleter)
                     it.deleter(it.ptr);
 
-            // delete nodes in linked list
-            Node* cur = head_.load(std::memory_order_acquire);
+            // delete epoch nodes in linked list
+            EpochNode* cur = head_.load(std::memory_order_acquire);
             while (cur)
             {
-                Node* next = cur->next;
+                EpochNode* next = cur->next;
                 delete cur;
                 cur = next;
             }
@@ -155,8 +155,8 @@ namespace arch::experimental
         {
             uint64_t min_epoch = std::numeric_limits<uint64_t>::max();
 
-            // scan linked list for min epoch (safe: list nodes are stable)
-            Node* cur = head_.load(std::memory_order_acquire);
+            // scan linked list for min epoch (safe: list epoch nodes are stable)
+            EpochNode* cur = head_.load(std::memory_order_acquire);
             while (cur)
             {
                 uint64_t v = cur->epoch.load(std::memory_order_acquire);
@@ -200,8 +200,8 @@ namespace arch::experimental
 
         std::atomic<uint64_t> global_epoch_{1};
 
-        // head of singly-linked list of Node*, each node allocated once per thread and not moved until program end
-        std::atomic<Node*> head_{nullptr};
+        // head of singly-linked list of EpochNode*, each epoch node allocated once per thread and not moved until program end
+        std::atomic<EpochNode*> head_{nullptr};
 
         std::mutex retired_mutex_;
         std::vector<RetiredItem> retired_;
@@ -211,18 +211,18 @@ namespace arch::experimental
     /**
      * @brief Topic for publishing and subscribing to messages
      * @ingroup arch_experimental
-     * @tparam MessageT Type of message data
+     * @tparam Type Type of message data
      *
      * Stores raw pointers to SubscriberSlot in hot-path vector to avoid shared_ptr refcounting.
      * Uses copy-on-write (COW) for lock-free subscriber list updates.
      * Similar to rclcpp::Topic in ROS2, but uses arch library components.
      */
-    template <typename MessageT>
-    class Topic : public std::enable_shared_from_this<Topic<MessageT>>
+    template <typename Type>
+    class Topic : public std::enable_shared_from_this<Topic<Type>>
     {
     public:
-        using SubscriberSlotPtr = std::shared_ptr<SubscriberSlot<MessageT>>;    ///< Shared pointer to subscriber slot
-        using SubscriberSlotRaw = SubscriberSlot<MessageT>*;                    ///< Raw pointer to subscriber slot
+        using SubscriberSlotPtr = std::shared_ptr<SubscriberSlot<Type>>;    ///< Shared pointer to subscriber slot
+        using SubscriberSlotRaw = SubscriberSlot<Type>*;                    ///< Raw pointer to subscriber slot
 
         /**
          * @brief Constructs topic
@@ -308,7 +308,7 @@ namespace arch::experimental
                 // In ROS2, this would typically result in a warning or error
             }
 
-            auto slot                               = std::make_shared<SubscriberSlot<MessageT>>(std::move(callback), std::move(group), qos, consumer_group);
+            auto slot                               = std::make_shared<SubscriberSlot<Type>>(std::move(callback), std::move(group), qos, consumer_group);
             std::vector<SubscriberSlotRaw>* old_ptr = slots_ptr_.load(std::memory_order_acquire);
             for (;;)
             {

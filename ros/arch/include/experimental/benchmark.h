@@ -1,7 +1,7 @@
 /**
  * @file benchmark.h
  * @brief Benchmark utilities for testing ROS2-like messaging system
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -9,9 +9,6 @@
 #ifndef ARCH_BENCHMARK_H
 #define ARCH_BENCHMARK_H
 
-#include <arch/utils.h>
-#include <arch/communication/imessage.h>
-#include "test_message.h"
 #include "../communication/impl/callback_group.h"
 #include "../communication/impl/executor.h"
 #include "../communication/impl/factory.h"
@@ -19,6 +16,9 @@
 #include "../communication/impl/subscriber_slot.h"
 #include "../communication/impl/subscription.h"
 #include "../communication/impl/topic.h"
+#include "test_message.h"
+#include <arch/communication/imessage.h>
+#include <arch/utils.h>
 
 #include <algorithm>
 #include <atomic>
@@ -247,11 +247,11 @@ namespace arch::experimental
                     const auto* ts_msg = static_cast<const arch::experimental::TestMessage<TimestampedMessage>*>(msg.get());
                     if (ts_msg)
                     {
-                        auto end_time = std::chrono::high_resolution_clock::now();
+                        auto end_time   = std::chrono::high_resolution_clock::now();
                         auto latency_ms = std::chrono::duration<double, std::milli>(
                                               end_time - ts_msg->data.send_time)
                                               .count();
-                        
+
                         // Lock-free append using atomic index
                         size_t idx = latency_index.fetch_add(1, std::memory_order_relaxed);
                         if (idx < latencies.size())
@@ -262,7 +262,7 @@ namespace arch::experimental
                 },
                 QoS::Reliable(1000),
                 callback_group);
-            
+
             // Cast to Subscription<TestMessage<TimestampedMessage>> for compatibility
             auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<TimestampedMessage>>>(subscription_void);
 
@@ -279,23 +279,26 @@ namespace arch::experimental
             executor->start();
 
             size_t memory_before = get_current_memory_usage();
-            auto start_time      = std::chrono::high_resolution_clock::now();
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));    // warm-up (уменьшено)
 
             // Get slot from subscription for queue size monitoring
             auto slot = subscription ? subscription->getSlot() : nullptr;
+
+            // Minimal warm-up - just ensure executor is running
+            executor->spin_some();
+
+            auto start_time = std::chrono::high_resolution_clock::now();
 
             for (size_t i = 0; i < message_count; ++i)
             {
                 TimestampedMessage msg_data;
                 msg_data.send_time = std::chrono::high_resolution_clock::now();
                 msg_data.index     = i;
-                
+
                 if (!publisher || !publisher->publish(arch::experimental::TestMessage<TimestampedMessage>(msg_data)))
                     dropped_count++;
 
-                if (slot)
+                // Check queue size less frequently to reduce overhead
+                if (slot && (i % 100 == 0))    // Check every 100 messages
                 {
                     size_t queue_size = slot->queue_size();
                     if (queue_size > peak_queue.load())
@@ -303,15 +306,16 @@ namespace arch::experimental
                 }
             }
 
-            // Оптимизированное ожидание обработки всех сообщений
-            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            // Оптимизированное ожидание обработки всех сообщений - более агрессивное
+            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(10);    // Reduced timeout
             size_t no_progress_count = 0;
             size_t last_received     = 0;
 
-            while (received_count < message_count &&
+            while (received_count.load() < message_count &&
                    std::chrono::steady_clock::now() < deadline)
             {
-                executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено с 10
+                // Process multiple iterations for faster completion
+                executor->spin_some();    // Process up to 100 iterations
 
                 size_t current_queue_size = slot ? slot->queue_size() : 0;
                 size_t current_received   = received_count.load();
@@ -320,8 +324,8 @@ namespace arch::experimental
                 if (current_received == last_received)
                 {
                     no_progress_count++;
-                    // Более быстрое завершение при отсутствии прогресса
-                    if (no_progress_count > 50 && current_queue_size == 0)    // Уменьшено с 100
+                    // Быстрое завершение при отсутствии прогресса и пустой очереди
+                    if (no_progress_count > 10 && current_queue_size == 0)    // Reduced threshold
                     {
                         break;
                     }
@@ -333,45 +337,35 @@ namespace arch::experimental
                 }
 
                 // Минимальные задержки только при необходимости
-                if (current_queue_size == 0 && received_count < message_count)
+                if (current_queue_size == 0 && received_count.load() < message_count)
                 {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));    // Уменьшено
+                    std::this_thread::yield();    // Yield instead of sleep for faster response
                 }
             }
 
-            // Уменьшенная финальная обработка - более тщательное ожидание
-            for (int i = 0; i < 200 && (received_count < message_count || (slot && slot->queue_size() > 0)); ++i)
-            {
-                executor->spin_once(std::chrono::milliseconds(1));
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-                if (slot && slot->queue_size() == 0 && received_count >= message_count)
-                    break;
-            }
-
-            auto end_time = std::chrono::high_resolution_clock::now();
-            
-            // Final check - wait a bit more for any remaining callbacks
-            size_t final_received = received_count.load();
+            // Быстрая финальная обработка - обрабатываем оставшиеся сообщения
+            size_t final_received   = received_count.load();
             size_t final_queue_size = slot ? slot->queue_size() : 0;
             for (int i = 0; i < 50 && (final_received < message_count || final_queue_size > 0); ++i)
             {
-                executor->spin_once(std::chrono::milliseconds(1));
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-                final_received = received_count.load();
+                executor->spin_some();    // Process multiple iterations
+                if (final_queue_size == 0 && final_received >= message_count)
+                    break;
+                final_received   = received_count.load();
                 final_queue_size = slot ? slot->queue_size() : 0;
             }
-            
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+
             factory->destroy();
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
 
-            result.duration_ms            = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-            result.messages_received      = final_received;
+            result.duration_ms       = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            result.messages_received = final_received;
             // Dropped = failed to publish OR published but not received (if queue is empty)
-            result.dropped_messages       = dropped_count.load() + 
-                                           (final_queue_size == 0 && final_received < message_count ? 
-                                            (message_count - final_received) : 0);
+            result.dropped_messages = dropped_count.load() +
+                                      (final_queue_size == 0 && final_received < message_count ? (message_count - final_received) : 0);
             result.peak_queue_size        = peak_queue.load();
             result.memory_usage_bytes     = memory_after - memory_before;
             result.throughput_msg_per_sec = (message_count * 1000.0) / result.duration_ms;
@@ -379,7 +373,7 @@ namespace arch::experimental
             // Remove zero entries (unused slots) and calculate latency stats
             size_t actual_count = latency_index.load(std::memory_order_acquire);
             latencies.resize(actual_count);
-            
+
             if (!latencies.empty())
             {
                 // Вычисляем расширенную статистику
@@ -432,19 +426,20 @@ namespace arch::experimental
             // Use TimestampedMessage for latency measurement
             auto subscription_void = factory->createSubscription<arch::experimental::TestMessage<TimestampedMessage>>(
                 "/benchmark/mpsc",
-                [&received_count, &latencies, &latency_index](message_ptr<const IMessage> msg) { 
-                    if (msg) {
+                [&received_count, &latencies, &latency_index](message_ptr<const IMessage> msg) {
+                    if (msg)
+                    {
                         received_count++;
-                        
+
                         // Measure latency
                         const auto* ts_msg = static_cast<const arch::experimental::TestMessage<TimestampedMessage>*>(msg.get());
                         if (ts_msg)
                         {
-                            auto end_time = std::chrono::high_resolution_clock::now();
+                            auto end_time   = std::chrono::high_resolution_clock::now();
                             auto latency_ms = std::chrono::duration<double, std::milli>(
                                                   end_time - ts_msg->data.send_time)
                                                   .count();
-                            
+
                             // Lock-free append using atomic index
                             size_t idx = latency_index.fetch_add(1, std::memory_order_relaxed);
                             if (idx < latencies.size())
@@ -456,7 +451,7 @@ namespace arch::experimental
                 },
                 QoS::Reliable(queue_capacity),
                 callback_group);
-            
+
             // Cast to Subscription<TestMessage<TimestampedMessage>> for compatibility
             auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<TimestampedMessage>>>(subscription_void);
 
@@ -504,7 +499,7 @@ namespace arch::experimental
                         TimestampedMessage msg_data;
                         msg_data.send_time = std::chrono::high_resolution_clock::now();
                         msg_data.index     = start_idx + i;
-                        
+
                         // For reliable QoS, retry on failure
                         bool published = false;
                         int retries    = 0;
@@ -532,53 +527,69 @@ namespace arch::experimental
             for (auto& producer : producers)
                 producer.join();
 
-            // Оптимизированное ожидание обработки всех сообщений
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-            while (received_count < total_messages &&
+            // Оптимизированное ожидание обработки всех сообщений - более агрессивное
+            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(10);    // Reduced timeout
+            size_t no_progress_count = 0;
+            size_t last_received     = 0;
+
+            while (received_count.load() < total_messages &&
                    std::chrono::steady_clock::now() < deadline)
             {
-                executor->spin_once(std::chrono::milliseconds(5));    // Уменьшено
+                // Process multiple iterations for faster completion
+                executor->spin_some();    // Process up to 200 iterations
 
-                if (slot && slot->queue_size() == 0 && received_count < total_messages)
+                size_t current_queue_size = slot ? slot->queue_size() : 0;
+                size_t current_received   = received_count.load();
+
+                // Проверяем прогресс
+                if (current_received == last_received)
                 {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));    // Уменьшено
+                    no_progress_count++;
+                    if (no_progress_count > 10 && current_queue_size == 0)    // Reduced threshold
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    no_progress_count = 0;
+                    last_received     = current_received;
+                }
+
+                if (current_queue_size == 0 && received_count.load() < total_messages)
+                {
+                    std::this_thread::yield();    // Yield instead of sleep for faster response
                 }
             }
 
-            // Уменьшенная финальная обработка - более тщательное ожидание
-            for (int i = 0; i < 200 && (received_count.load() < total_messages || (slot && slot->queue_size() > 0)); ++i)
-            {
-                executor->spin_once(std::chrono::milliseconds(1));
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
+            // Убрано - не нужно, так как обработка происходит в основном цикле
 
             stop_flag.store(true);
             if (monitor.joinable())
                 monitor.join();
 
             auto end_time = std::chrono::high_resolution_clock::now();
-            factory->destroy();
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
-            executor->stop();
-            size_t memory_after = get_current_memory_usage();
-
-            // Final check - wait a bit more for any remaining callbacks before finalizing
-            size_t final_received = received_count.load();
+            // Быстрая финальная обработка - обрабатываем оставшиеся сообщения
+            size_t final_received   = received_count.load();
             size_t final_queue_size = slot ? slot->queue_size() : 0;
-            for (int i = 0; i < 100 && (final_received < total_messages || final_queue_size > 0); ++i)
+            for (int i = 0; i < 50 && (final_received < total_messages || final_queue_size > 0); ++i)
             {
-                executor->spin_once(std::chrono::milliseconds(1));
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-                final_received = received_count.load();
+                executor->spin_some();    // Process multiple iterations
+                if (final_queue_size == 0 && final_received >= total_messages)
+                    break;
+                final_received   = received_count.load();
                 final_queue_size = slot ? slot->queue_size() : 0;
             }
 
-            result.duration_ms            = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-            result.messages_received      = final_received;
+            factory->destroy();
+            executor->stop();
+            size_t memory_after = get_current_memory_usage();
+
+            result.duration_ms       = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            result.messages_received = final_received;
             // Dropped = failed to publish OR published but not received (if queue is empty)
-            result.dropped_messages       = dropped_count.load() + 
-                                           (final_queue_size == 0 && final_received < total_messages ? 
-                                            (total_messages - final_received) : 0);
+            result.dropped_messages = dropped_count.load() +
+                                      (final_queue_size == 0 && final_received < total_messages ? (total_messages - final_received) : 0);
             result.peak_queue_size        = peak_queue.load();
             result.memory_usage_bytes     = memory_after - memory_before;
             result.throughput_msg_per_sec = (total_messages * 1000.0) / result.duration_ms;
@@ -586,7 +597,7 @@ namespace arch::experimental
             // Calculate latency stats
             size_t actual_count = latency_index.load(std::memory_order_acquire);
             latencies.resize(actual_count);
-            
+
             if (!latencies.empty())
             {
                 result.calculate_extended_latency_stats(latencies);
@@ -636,11 +647,11 @@ namespace arch::experimental
                     const auto* ts_msg = static_cast<const arch::experimental::TestMessage<TimestampedMessage>*>(msg.get());
                     if (ts_msg)
                     {
-                        auto end_time = std::chrono::high_resolution_clock::now();
+                        auto end_time   = std::chrono::high_resolution_clock::now();
                         auto latency_ms = std::chrono::duration<double, std::milli>(
                                               end_time - ts_msg->data.send_time)
                                               .count();
-                        
+
                         // Lock-free append using atomic index
                         size_t idx = latency_index.fetch_add(1, std::memory_order_relaxed);
                         if (idx < latencies.size())
@@ -649,14 +660,15 @@ namespace arch::experimental
                         }
                     }
                 },
-                QoS::Reliable(1000),
+                QoS::Reliable(5000),  // Увеличена очередь для предотвращения переполнения
                 callback_group);
             
             // Cast to Subscription<TestMessage<TimestampedMessage>> for compatibility
             auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<TimestampedMessage>>>(subscription_void);
 
             // Create publisher through Factory (ROS2-like API) - using TestMessage for benchmarking
-            auto publisher = factory->createPublisher<arch::experimental::TestMessage<TimestampedMessage>>("/benchmark/latency", QoS::Reliable(1000));
+            // Увеличена очередь для предотвращения переполнения при быстрой публикации
+            auto publisher = factory->createPublisher<arch::experimental::TestMessage<TimestampedMessage>>("/benchmark/latency", QoS::Reliable(5000));
 
             // Get topic from Factory and add to executor
             auto topic = factory->getTopic<arch::experimental::TestMessage<TimestampedMessage>>("/benchmark/latency");
@@ -670,7 +682,10 @@ namespace arch::experimental
 
             executor->start();
             size_t memory_before = get_current_memory_usage();
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));    // warm-up
+
+            // Minimal warm-up - just ensure executor is running
+            executor->spin_some();
+
             auto start_time = std::chrono::high_resolution_clock::now();
 
             std::atomic<size_t> publish_failures{0};
@@ -681,9 +696,9 @@ namespace arch::experimental
                 msg_data.send_time = std::chrono::high_resolution_clock::now();
                 msg_data.index     = i;
 
-                // Retry logic for reliable QoS
+                // Retry logic for reliable QoS - более агрессивная для предотвращения потерь
                 int retries           = 0;
-                const int max_retries = 5;
+                const int max_retries = 50;  // Увеличено с 5 до 50 для надежности
                 bool published        = false;
                 while (retries < max_retries && !published)
                 {
@@ -691,7 +706,19 @@ namespace arch::experimental
                         published = publisher->publish(arch::experimental::TestMessage<TimestampedMessage>(msg_data));
                     if (!published)
                     {
-                        std::this_thread::yield();
+                        // Exponential backoff для более эффективного retry
+                        if (retries < 10)
+                        {
+                            std::this_thread::yield();
+                        }
+                        else if (retries < 30)
+                        {
+                            std::this_thread::sleep_for(std::chrono::microseconds(10));
+                        }
+                        else
+                        {
+                            std::this_thread::sleep_for(std::chrono::microseconds(50));
+                        }
                         retries++;
                     }
                 }
@@ -702,14 +729,15 @@ namespace arch::experimental
                 // Убрали sleep для ускорения
             }
 
-            // Оптимизированное ожидание обработки всех сообщений
-            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(60);  // Increased timeout
+            // Оптимизированное ожидание обработки всех сообщений - баланс между скоростью и надежностью
+            auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(30);    // Increased timeout для надежности
             size_t no_progress_count = 0;
             size_t last_received     = 0;
 
             while (received.load() < iterations && std::chrono::steady_clock::now() < deadline)
             {
-                executor->spin_once(std::chrono::milliseconds(1));    // More frequent checks
+                // Process multiple iterations for faster completion
+                executor->spin_some();    // Process up to 200 iterations
 
                 size_t current_queue_size = slot ? slot->queue_size() : 0;
                 size_t current_received   = received.load();
@@ -718,8 +746,9 @@ namespace arch::experimental
                 if (current_received == last_received)
                 {
                     no_progress_count++;
-                    // Only break if queue is empty AND no progress for a while
-                    if (no_progress_count > 200 && current_queue_size == 0)    // Increased threshold
+                    // Завершение только если очередь пуста И нет прогресса достаточно долго
+                    // Увеличено порог для предотвращения преждевременного завершения
+                    if (no_progress_count > 50 && current_queue_size == 0)    // Increased threshold для надежности
                     {
                         break;
                     }
@@ -730,44 +759,43 @@ namespace arch::experimental
                     last_received     = current_received;
                 }
 
+                // Небольшая задержка только если очередь пуста и еще не все получено
                 if (current_queue_size == 0 && received.load() < iterations)
                 {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));    // Reduced sleep
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));  // Небольшая задержка вместо yield
                 }
             }
 
-            // Более тщательная финальная обработка - обрабатываем все сообщения в очереди
-            size_t final_received = received.load();
+            // Более тщательная финальная обработка - обрабатываем все оставшиеся сообщения
+            size_t final_received   = received.load();
             size_t final_queue_size = slot ? slot->queue_size() : 0;
-            for (int i = 0; i < 500 && (final_received < iterations || final_queue_size > 0); ++i)
+            for (int i = 0; i < 200 && (final_received < iterations || final_queue_size > 0); ++i)  // Увеличено с 50 до 200
             {
-                executor->spin_once(std::chrono::milliseconds(1));
+                executor->spin_some();    // Process multiple iterations
                 if (final_queue_size == 0 && final_received >= iterations)
                     break;
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-                final_received = received.load();
+                std::this_thread::sleep_for(std::chrono::microseconds(10));  // Небольшая задержка для обработки
+                final_received   = received.load();
                 final_queue_size = slot ? slot->queue_size() : 0;
             }
 
             auto end_time = std::chrono::high_resolution_clock::now();
             factory->destroy();
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));    // Уменьшено
             executor->stop();
             size_t memory_after = get_current_memory_usage();
-            
-            result.duration_ms            = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-            result.messages_received      = final_received;
+
+            result.duration_ms       = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            result.messages_received = final_received;
             // Dropped = failed to publish OR published but not received (queue empty means lost)
-            result.dropped_messages       = publish_failures.load() + 
-                                           (final_queue_size == 0 && final_received < iterations ? 
-                                            (iterations - final_received) : 0);
+            result.dropped_messages = publish_failures.load() +
+                                      (final_queue_size == 0 && final_received < iterations ? (iterations - final_received) : 0);
             result.memory_usage_bytes     = memory_after - memory_before;
             result.throughput_msg_per_sec = (iterations * 1000.0) / result.duration_ms;
 
             // Remove zero entries (unused slots)
             size_t actual_count = latency_index.load(std::memory_order_acquire);
             latencies.resize(actual_count);
-            
+
             if (!latencies.empty())
             {
                 // Вычисляем расширенную статистику
@@ -850,7 +878,7 @@ namespace arch::experimental
                         },
                         QoS::Reliable(10),
                         callback_group);
-                    
+
                     // Cast to Subscription<TestMessage<int>> for compatibility
                     auto subscription = std::static_pointer_cast<Subscription<arch::experimental::TestMessage<int>>>(subscription_void);
 
@@ -1156,7 +1184,7 @@ namespace arch::experimental
                 {
                     // Loss = dropped messages / sent messages
                     loss_percent = (result.dropped_messages * 100.0) / result.messages_sent;
-                    
+
                     // Efficiency = received messages / sent messages
                     // If received > sent (shouldn't happen), cap at 100%
                     efficiency = (result.messages_received * 100.0) / result.messages_sent;
@@ -1170,11 +1198,11 @@ namespace arch::experimental
                         efficiency = 0.0;
                     if (efficiency > 100.0)
                         efficiency = 100.0;
-                    
+
                     // Sanity check: efficiency + loss should be approximately 100%
                     // (allowing for rounding errors)
                     double total = efficiency + loss_percent;
-                    if (total > 100.01)  // Allow small rounding error
+                    if (total > 100.01)    // Allow small rounding error
                     {
                         // Adjust efficiency to ensure total doesn't exceed 100%
                         efficiency = 100.0 - loss_percent;

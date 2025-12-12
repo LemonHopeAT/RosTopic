@@ -4,15 +4,9 @@ project(ROS_TOPIC LANGUAGES CXX)
 
 set(USE_ASAN ON)
 
-set(CMAKE_AUTOUIC ON)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core)
 
 if (NOT DEFINED EXTERNAL_LIBS_PATH)
     if (${CMAKE_HOST_SYSTEM_NAME} STREQUAL "Linux")
@@ -37,6 +31,8 @@ add_executable(ROS_TOPIC
     ros/arch/src/communication/impl/wait_set.cpp
     ros/arch/src/communication/impl/factory.cpp
     ros/arch/include/concurrency/impl/queue_thread_pool.h
+    ros/arch/include/concurrency/impl/lock_free_MPMC_queue.h
+    ros/arch/include/concurrency/impl/lock_free_MPMC_queue_impl.h
     ros/arch/include/experimental/test_message.h
     ros/arch/include/communication/waitable.h
     ros/arch/include/communication/impl/callback_group.h
@@ -48,6 +44,7 @@ add_executable(ROS_TOPIC
     ros/arch/include/communication/impl/subscription.h
     ros/arch/include/communication/impl/topic.h
     ros/arch/include/communication/impl/wait_set.h
+    ros/arch/include/communication/impl/topic_registry.h
     ros/arch/include/experimental/benchmark.h
   main.cpp
 )
@@ -60,7 +57,7 @@ target_include_directories(ROS_TOPIC PRIVATE
     ${PROJECT_SOURCE_DIR}/ros/arch
 )
 
-target_link_libraries(ROS_TOPIC  pthread Qt${QT_VERSION_MAJOR}::Core
+target_link_libraries(ROS_TOPIC  pthread
     kpp_libs::core)
 
 include(GNUInstallDirs)
@@ -68,3 +65,5 @@ install(TARGETS ROS_TOPIC
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+
+add_subdirectory(example/)

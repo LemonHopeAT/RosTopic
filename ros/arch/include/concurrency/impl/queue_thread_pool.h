@@ -1,7 +1,7 @@
 /**
  * @file queue_thread_pool.h
  * @brief Thread pool implementation with task queue supporting both ATask and functors
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_ccr_impl
  */
@@ -10,33 +10,83 @@
 #define ARCH_CCR_IMPL_QUEUE_THREAD_POOL_H
 
 #include <atomic>
-#include <condition_variable>
 #include <functional>
 #include <memory>
-#include <mutex>
-#include <queue>
 #include <thread>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
+#include <unordered_set>
 
 #include "arch/concurrency/atask.h"
 #include "arch/concurrency/ithread_pool.h"
+#include "concurrency/impl/lock_free_MPMC_queue.h"
+#include "communication/impl/wait_set.h"
 
 namespace arch::impl
 {
+    // Forward declaration
+    class QueueThreadPool;
 
     /**
-     * @brief Thread pool implementation with task queue
+     * @brief Wrapper for task function with cancellation support
+     * @note Used internally by QueueThreadPool for task cancellation
+     */
+    class CancellableTaskWrapper
+    {
+    public:
+        using TaskFunction = std::function<void()>;
+        
+        explicit CancellableTaskWrapper(TaskFunction func)
+            : func_(std::move(func))
+            , cancelled_(false)
+        {
+        }
+
+        void operator()()
+        {
+            // Check cancellation flag before execution
+            if (!cancelled_.load(std::memory_order_acquire))
+            {
+                func_();
+            }
+        }
+
+        void cancel() noexcept
+        {
+            cancelled_.store(true, std::memory_order_release);
+        }
+
+        bool is_cancelled() const noexcept
+        {
+            return cancelled_.load(std::memory_order_acquire);
+        }
+
+        // Compare function targets for matching
+        bool matches(const TaskFunction& other) const
+        {
+            return func_.target_type() == other.target_type();
+        }
+
+    private:
+        TaskFunction func_;
+        std::atomic<bool> cancelled_;
+    };
+
+
+    /**
+     * @brief Lock-free thread pool implementation with task queue
      * @ingroup arch_ccr_impl
      *
-     * Manages threads using task queue. The number of threads does not change.
+     * Manages threads using lock-free task queue. The number of threads does not change.
      * Threads try to access the task queue. If queue is not empty,
      * first thread that accesses it takes new task for processing.
      * After task is finished, thread is free and tries to access the queue again.
      *
      * Supports both ATask objects (with operator()) and simple functors (std::function<void()>).
      * Inherits from arch::IThreadPool for compatibility with arch library.
+     * 
+     * Uses LockFreeMPMCQueue for task queue and WaitSet for thread synchronization.
+     * All operations are lock-free and do not use mutexes.
      */
     class QueueThreadPool : public arch::IThreadPool
     {
@@ -45,17 +95,43 @@ namespace arch::impl
 
     private:
         using thread_type = std::shared_ptr<std::thread>;    ///< stored threads type alias
+        using CancellableTaskPtr = std::shared_ptr<CancellableTaskWrapper>;    ///< Pointer to cancellable task wrapper
 
-        std::unordered_map<uint32_t, TaskFunction> exec_tasks_;    ///< map for executing tasks (functions)
-        std::queue<TaskFunction> tasks_;                           ///< task queue (functions)
+        // Lock-free task queue - supports multiple producers and consumers
+        // Store CancellableTaskWrapper for cancellation support
+        arch::experimental::LockFreeMPMCQueue<TaskFunction> tasks_;
+        
         std::vector<thread_type> threads_;                         ///< available threads
 
-        std::mutex exec_task_mutex_;             ///< mutex for exec task map
-        std::mutex task_mutex_;                  ///< mutex for task queue
-        std::condition_variable task_access_;    ///< conditional variable for access to task queue
+        arch::experimental::WaitSet wait_set_;    ///< Lock-free wait set for thread synchronization
+
+        // Lock-free storage for active tasks (for cancellation)
+        // Use weak_ptr to avoid keeping tasks alive unnecessarily
+        struct TaskNode
+        {
+            std::weak_ptr<CancellableTaskWrapper> task;
+            std::atomic<TaskNode*> next{nullptr};
+            
+            TaskNode(std::weak_ptr<CancellableTaskWrapper> t) : task(std::move(t)) {}
+        };
+        
+        std::atomic<TaskNode*> active_tasks_head_{nullptr};    ///< Lock-free linked list head
 
         std::atomic<bool> is_run_{true};      ///< thread exit flag
         std::atomic<bool> is_pause_{true};    ///< distributing pause flag
+        
+        static constexpr size_t DEFAULT_QUEUE_CAPACITY = 1024;    ///< Default queue capacity
+        
+        /**
+         * @brief Register task wrapper for cancellation tracking
+         * @param task_ptr Shared pointer to cancellable task wrapper
+         */
+        void register_task_for_cancellation(std::shared_ptr<CancellableTaskWrapper> task_ptr);
+        
+        /**
+         * @brief Cleanup expired task nodes from cancellation tracking
+         */
+        void cleanup_expired_tasks();
 
     public:
         /**
@@ -110,14 +186,15 @@ namespace arch::impl
         }
 
         /**
-         * @brief Push function as task to queue
+         * @brief Push function as task to queue (lock-free)
          * @param func Function to execute
          */
         void pushTaskFunction(TaskFunction func);
 
         /**
          * @brief Erase task from execution by function
-         * @param func Task function to erase (will be compared and removed if found)
+         * @note Cancels matching tasks by setting cancellation flag
+         * @param func Task function to erase (will be compared by target_type and cancelled if found)
          */
         void eraseTask(const TaskFunction& func);
 

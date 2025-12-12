@@ -1,7 +1,7 @@
 /**
  * @file test_message.h
  * @brief Test message wrapper for debugging and benchmarking
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  * 

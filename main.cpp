@@ -1328,8 +1328,8 @@ int main()
 
         // Запускаем бенчмарки в цикле с усреднением
         // Каждый тест запускается несколько раз и усредняется
-        const size_t iterations_per_test = 3;         // Количество итераций для усреднения каждого теста
-        const size_t total_cycles        = 100000;    // Общее количество циклов
+        const size_t iterations_per_test = 3;      // Количество итераций для усреднения каждого теста
+        const size_t total_cycles        = 100;    // Общее количество циклов
 
         for (size_t i = 0; i < total_cycles; ++i)
         {

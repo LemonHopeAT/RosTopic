@@ -1,7 +1,7 @@
 /**
  * @file callback_group.cpp
  * @brief Callback group implementation
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  */
 

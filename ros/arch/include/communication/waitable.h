@@ -1,7 +1,7 @@
 /**
  * @file waitable.h
  * @brief Waitable interface for objects that can be processed by Executor
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */

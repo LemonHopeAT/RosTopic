@@ -1,7 +1,7 @@
 /**
  * @file subscriber_slot.h
  * @brief Lock-free subscriber slot implementation with message queue and callback execution
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -13,6 +13,8 @@
 #include "callback_group.h"
 #include "qos.h"
 #include <arch/communication/imessage.h>
+#include <concurrency/impl/lock_free_MPMC_queue.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -23,288 +25,22 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <vector>
 #include <type_traits>
-
-// Check C++20 support for atomic<shared_ptr>
-#if __cplusplus >= 202002L && defined(__cpp_lib_atomic_shared_ptr)
-#define ARCH_HAS_ATOMIC_SHARED_PTR 1
-#else
-#define ARCH_HAS_ATOMIC_SHARED_PTR 0
-#endif
+#include <vector>
 
 namespace arch::experimental
 {
 
     /**
-     * @brief Lock-free MPMC (Multiple Producer Multiple Consumer) bounded queue
-     * @ingroup arch_experimental
-     * @tparam T Type of elements stored in queue (must be move-constructible and move-assignable)
-     *
-     * Vyukov MPMC bounded queue implementation. Uses standard sequence-based algorithm with
-     * acquire/release ordering. For shared_ptr types, uses std::atomic<shared_ptr> (C++20)
-     * for safer memory operations in lock-free context.
-     * Use this when you need multiple producers or multiple consumers.
-     */
-    template <typename T>
-    class LockFreeMPMCQueue
-    {
-        static_assert(std::is_move_constructible<T>::value && std::is_move_assignable<T>::value,
-                      "T must be move-constructible and move-assignable");
-
-        // Check if T is a shared_ptr type
-        template <typename U>
-        struct is_shared_ptr : std::false_type {};
-        
-        template <typename U>
-        struct is_shared_ptr<std::shared_ptr<U>> : std::true_type {};
-        
-        template <typename U>
-        struct is_shared_ptr<const std::shared_ptr<U>> : std::true_type {};
-
-        // Align Cell to cache line boundary to avoid false sharing
-        struct alignas(64) Cell
-        {
-            std::atomic<size_t> seq;
-            T data;
-        };
-        
-        // Specialized Cell for shared_ptr types using atomic<shared_ptr> (C++20)
-        // For C++17, we use regular shared_ptr with proper memory ordering via seq
-        template <typename U>
-        struct CellAtomic
-        {
-            std::atomic<size_t> seq;
-#if ARCH_HAS_ATOMIC_SHARED_PTR
-            std::atomic<U> data;  // C++20: atomic<shared_ptr> is supported
-#else
-            alignas(64) U data;  // C++17: use regular shared_ptr, seq provides synchronization
-#endif
-            
-            CellAtomic() : seq(0)
-#if ARCH_HAS_ATOMIC_SHARED_PTR
-                , data(nullptr)
-#endif
-            {}
-        };
-        
-        // Use specialized cell for shared_ptr types (both C++17 and C++20)
-        using CellType = typename std::conditional<is_shared_ptr<T>::value,
-                                                   CellAtomic<T>,
-                                                   Cell>::type;
-
-    public:
-        /**
-         * @brief Constructs MPMC queue with given capacity
-         * @param capacity Queue capacity (will be rounded up to power of 2)
-         * @throw std::invalid_argument if capacity is 0
-         */
-        explicit LockFreeMPMCQueue(size_t capacity)
-        : capacity_(round_up_pow2(capacity)), mask_(capacity_ - 1), buffer_(capacity_)
-        {
-            if (capacity == 0)
-                throw std::invalid_argument("capacity must be > 0");
-            for (size_t i = 0; i < capacity_; ++i)
-            {
-                buffer_[i].seq.store(i, std::memory_order_relaxed);
-#if ARCH_HAS_ATOMIC_SHARED_PTR
-                if constexpr (is_shared_ptr<T>::value)
-                {
-                    // Initialize atomic<shared_ptr> to nullptr
-                    buffer_[i].data.store(T{}, std::memory_order_relaxed);
-                }
-#endif
-            }
-            enqueue_pos_.store(0, std::memory_order_relaxed);
-            dequeue_pos_.store(0, std::memory_order_relaxed);
-        }
-
-        LockFreeMPMCQueue(const LockFreeMPMCQueue&) = delete;
-        LockFreeMPMCQueue& operator=(const LockFreeMPMCQueue&) = delete;
-
-        /**
-         * @brief Push item into queue (non-blocking)
-         * @param item Item to push (copied)
-         * @return true if pushed successfully, false if queue is full
-         */
-        bool push(const T& item) { return emplace(item); }
-
-        /**
-         * @brief Push item into queue (non-blocking)
-         * @param item Item to push (moved)
-         * @return true if pushed successfully, false if queue is full
-         */
-        bool push(T&& item) { return emplace(std::move(item)); }
-
-        /**
-         * @brief Emplace item into queue (non-blocking)
-         * @param args Arguments to construct item
-         * @return true if emplaced successfully, false if queue is full
-         */
-        template <typename... Args>
-        bool emplace(Args&&... args)
-        {
-            size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
-            for (;;)
-            {
-                CellType& cell = buffer_[pos & mask_];
-                size_t seq     = cell.seq.load(std::memory_order_acquire);
-                intptr_t dif   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-                if (dif == 0)
-                {
-                    // Use acquire-release for CAS to ensure proper synchronization
-                    if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
-                                                           std::memory_order_acq_rel,
-                                                           std::memory_order_acquire))
-                    {
-                        // For shared_ptr types, use atomic store (C++20) or regular assignment (C++17)
-                        if constexpr (is_shared_ptr<T>::value)
-                        {
-#if ARCH_HAS_ATOMIC_SHARED_PTR
-                            // C++20: Atomic store for shared_ptr - safer memory visibility
-                            cell.data.store(T(std::forward<Args>(args)...), std::memory_order_release);
-#else
-                            // C++17: Store data - seq.store(release) below provides release semantics
-                            // No need for explicit fence - seq.store(release) ensures visibility
-                            cell.data = T(std::forward<Args>(args)...);
-#endif
-                        }
-                        else
-                        {
-                            // For non-shared_ptr types, use regular assignment
-                            // seq.store(release) below ensures data visibility
-                            cell.data = T(std::forward<Args>(args)...);
-                        }
-                        // publish: make data visible before seq update
-                        // Use release to ensure all writes to data are visible
-                        // This release store synchronizes with acquire load in pop()
-                        cell.seq.store(pos + 1, std::memory_order_release);
-                        return true;
-                    }
-                    // else retry with updated pos
-                }
-                else if (dif < 0)
-                {
-                    // queue full
-                    return false;
-                }
-                else
-                {
-                    pos = enqueue_pos_.load(std::memory_order_relaxed);    // retry with fresh tail
-                }
-            }
-        }
-
-        /**
-         * @brief Pop item from queue (non-blocking)
-         * @return Optional containing item if available, empty optional if queue is empty
-         */
-        std::optional<T> pop()
-        {
-            size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
-            for (;;)
-            {
-                CellType& cell = buffer_[pos & mask_];
-                size_t seq     = cell.seq.load(std::memory_order_acquire);
-                intptr_t dif   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
-                if (dif == 0)
-                {
-                    // Use acquire-release for CAS to ensure proper synchronization
-                    if (dequeue_pos_.compare_exchange_weak(pos, pos + 1,
-                                                           std::memory_order_acq_rel,
-                                                           std::memory_order_acquire))
-                    {
-                        // For shared_ptr types, use atomic load (C++20) or regular move (C++17)
-                        T res;
-                        if constexpr (is_shared_ptr<T>::value)
-                        {
-#if ARCH_HAS_ATOMIC_SHARED_PTR
-                            // C++20: Atomic load for shared_ptr - safer memory visibility
-                            res = cell.data.load(std::memory_order_acquire);
-                            // Clear the atomic shared_ptr
-                            cell.data.store(T{}, std::memory_order_relaxed);
-#else
-                            // C++17: seq.load(acquire) above ensures we see producer's writes
-                            // seq == pos+1 means data is ready (set by producer with release)
-                            // Move data out - seq provides acquire semantics
-                            res = std::move(cell.data);
-                            // Clear data - seq.store(release) below ensures visibility
-                            cell.data = T{};
-#endif
-                        }
-                        else
-                        {
-                            // For non-shared_ptr types, use regular move
-                            res = std::move(cell.data);
-                        }
-                        // mark slot as free for next round
-                        // Use release to ensure all operations are visible
-                        // This release store synchronizes with acquire load in emplace()
-                        cell.seq.store(pos + capacity_, std::memory_order_release);
-                        return std::optional<T>(std::move(res));
-                    }
-                    // else retry
-                }
-                else if (dif < 0)
-                {
-                    // empty
-                    return std::nullopt;
-                }
-                else
-                {
-                    pos = dequeue_pos_.load(std::memory_order_relaxed);
-                }
-            }
-        }
-
-        bool empty() const
-        {
-            size_t head = dequeue_pos_.load(std::memory_order_acquire);
-            size_t tail = enqueue_pos_.load(std::memory_order_acquire);
-            return tail == head;
-        }
-
-        // approximate current size (lock-free snapshot)
-        size_t size() const
-        {
-            size_t head = dequeue_pos_.load(std::memory_order_acquire);
-            size_t tail = enqueue_pos_.load(std::memory_order_acquire);
-            if (tail >= head)
-                return tail - head;
-            // wrap-around guard (shouldn't normally happen for monotonic counters)
-            return (std::numeric_limits<size_t>::max() - head + tail + 1);
-        }
-
-        size_t capacity() const noexcept { return capacity_; }
-
-    private:
-        static size_t round_up_pow2(size_t x)
-        {
-            if (x == 0)
-                return 1;
-            --x;
-            for (size_t i = 1; i < sizeof(size_t) * 8; i <<= 1)
-                x |= x >> i;
-            return ++x;
-        }
-
-        const size_t capacity_;
-        const size_t mask_;
-        std::vector<CellType> buffer_;
-        alignas(64) std::atomic_size_t enqueue_pos_{0};
-        alignas(64) std::atomic_size_t dequeue_pos_{0};
-    };
-
-    /**
      * @brief Subscriber slot with lock-free message queue and safe callback execution
      * @ingroup arch_experimental
-     * @tparam MessageT Type of message data
+     * @tparam Type Type of message data
      *
      * Manages a lock-free queue of MessagePtr<T> and provides safe invalidation
      * of callback without heavy locks. Supports QoS policies (Reliable/BestEffort)
      * and callback groups for thread-safe execution.
      */
-    template <typename MessageT>
+    template <typename Type>
     class SubscriberSlot final
     {
     public:
@@ -443,7 +179,7 @@ namespace arch::experimental
             if (qos_.reliability == QoS::Reliability::Reliable)
             {
                 int retries           = 0;
-                const int max_retries = 100;  // Increased retries for reliable QoS
+                const int max_retries = 100;    // Increased retries for reliable QoS
                 while (retries < max_retries)
                 {
                     // Create a copy for this attempt (shared_ptr is cheap to copy)

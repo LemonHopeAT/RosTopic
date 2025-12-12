@@ -1,7 +1,7 @@
 /**
  * @file executor.h
  * @brief Lock-free executor for processing messages from topics
- * @date 2025
+ * @date 15.12.2025
  * @version 1.0.0
  * @ingroup arch_experimental
  */
@@ -39,16 +39,16 @@ namespace arch::experimental
     {
     private:
         /**
-         * @brief Node in lock-free linked list of topics
+         * @brief Topic node in lock-free linked list of topics
          */
-        struct Node
+        struct TopicNode
         {
             std::shared_ptr<void> shared_topic;     ///< Shared pointer to topic (for performance)
             std::function<void()> process_func;    ///< Function to process topic messages
-            std::atomic<Node*> next{nullptr};      ///< Next node in list
+            std::atomic<TopicNode*> next{nullptr};      ///< Next node in list
             std::atomic<bool> removed{false};      ///< Removal flag
 
-            Node(std::shared_ptr<void> s, std::function<void()> f)
+            TopicNode(std::shared_ptr<void> s, std::function<void()> f)
             : shared_topic(std::move(s)), process_func(std::move(f)) {}
         };
 
@@ -66,15 +66,15 @@ namespace arch::experimental
         void stop();
 
         // Добавление топика lock-free: просто вставка узла в голову списка
-        template <typename MessageT>
-        void add_topic(std::shared_ptr<Topic<MessageT>> topic)
+        template <typename Type>
+        void add_topic(std::shared_ptr<Topic<Type>> topic)
         {
             // Store shared_ptr directly to avoid weak_ptr.lock() overhead
-            // Node will be cleaned up only on stop(), so this is safe
+            // TopicNode will be cleaned up only on stop(), so this is safe
             auto shared_topic = std::shared_ptr<void>(std::static_pointer_cast<void>(topic));
 
             auto process = [shared_topic]() {
-                auto topic_ptr = std::static_pointer_cast<Topic<MessageT>>(
+                auto topic_ptr = std::static_pointer_cast<Topic<Type>>(
                     std::static_pointer_cast<void>(shared_topic));
                 if (!topic_ptr)
                     return;
@@ -93,9 +93,9 @@ namespace arch::experimental
                     
                     int processed          = 0;
                     // Adaptive batch size: process more messages if queue is large
-                    // Balance between latency and throughput
+                    // Increased batch size for better throughput and reduced Duration
                     size_t queue_size = slot->queue_size();
-                    int max_per_slot = queue_size > 1000 ? 1000 : 100;  // Adaptive batch size
+                    int max_per_slot = queue_size > 5000 ? 5000 : (queue_size > 1000 ? 2000 : 500);  // Increased batch sizes
                     while (processed < max_per_slot)
                     {
                         auto msg = slot->pop_message();
@@ -119,13 +119,13 @@ namespace arch::experimental
                 }
             };
 
-            Node* new_node = new Node(std::move(shared_topic), std::move(process));
+            TopicNode* new_node = new TopicNode(std::move(shared_topic), std::move(process));
 
             // register wake callback in topic so publish() will wake executor
             topic->set_wake_callback([this]() { this->wake_one(); });
 
             // lock-free push front
-            Node* old_head = head_.load(std::memory_order_acquire);
+            TopicNode* old_head = head_.load(std::memory_order_acquire);
             do
             {
                 new_node->next.store(old_head, std::memory_order_relaxed);
@@ -150,7 +150,7 @@ namespace arch::experimental
         size_t get_topics_processed() const;
 
         /**
-         * @brief Cleanup all nodes in list
+         * @brief Cleanup all topic nodes in list
          * @note Вызывать ТОЛЬКО когда все воркеры остановлены
          */
         void cleanup_all_nodes();
@@ -160,8 +160,8 @@ namespace arch::experimental
         size_t thread_count_;
         std::unique_ptr<arch::impl::QueueThreadPool> thread_pool_;    ///< Thread pool for worker threads
 
-        // Lock-free односвязный список: head указывает на первый Node*.
-        std::atomic<Node*> head_;
+        // Lock-free односвязный список: head указывает на первый TopicNode*.
+        std::atomic<TopicNode*> head_;
 
         WaitSet waitset_;
     };
